@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="7.0")
+app = FastAPI(title="VaultGrid OS", version="8.0")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -22,7 +22,7 @@ VAULT_GRID_STYLE = """
     * { box-sizing: border-box; }
     body {
         font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        background: radial-gradient(circle at top left, #090d16, #0f172a, #020617);
+        background: radial-gradient(circle at top left, #070b14, #0f172a, #020617);
         color: #f8fafc;
         margin: 0;
         padding: 20px;
@@ -39,7 +39,7 @@ VAULT_GRID_STYLE = """
         border-radius: 24px;
         padding: 30px;
         width: 100%;
-        max-width: 900px;
+        max-width: 950px;
         box-shadow: 0 25px 60px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.15);
     }
     h1, h2 { 
@@ -99,12 +99,34 @@ VAULT_GRID_STYLE = """
     th { color: #38bdf8; }
     a.file-link { color: #38bdf8; text-decoration: none; font-weight: bold; margin-right: 15px; }
     a.file-link:hover { text-decoration: underline; }
+    a.folder-link { color: #fbbf24; text-decoration: none; font-weight: bold; display: block; margin: 5px 0; }
+    a.folder-link:hover { text-decoration: underline; }
     a.delete-link { color: #f87171; text-decoration: none; }
     a.delete-link:hover { text-decoration: underline; }
-    .box-section { background: rgba(15, 23, 42, 0.4); padding: 15px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.05); margin-top: 15px; }
+    .box-section { background: rgba(15, 23, 42, 0.5); padding: 15px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.05); margin-top: 15px; }
+    .progress-bar-bg { background: rgba(255,255,255,0.1); border-radius: 10px; height: 12px; width: 100%; overflow: hidden; margin-top: 5px; }
+    .progress-bar-fill { background: linear-gradient(90deg, #38bdf8, #0284c7); height: 100%; width: 12%; }
+    .breadcrumb { background: rgba(15,23,42,0.8); padding: 10px 15px; border-radius: 8px; margin-bottom: 15px; font-family: monospace; color: #38bdf8; }
     hr { border: 0; border-top: 1px solid rgba(255, 255, 255, 0.1); margin: 20px 0; }
 </style>
 """
+
+def get_file_icon(filename: str):
+    ext = filename.split(".")[-1].lower() if "." in filename else ""
+    if ext in ["png", "jpg", "jpeg", "gif", "webp"]:
+        return "🖼️"
+    elif ext in ["mp4", "mov", "avi"]:
+        return "🎬"
+    elif ext in ["mp3", "wav", "flac"]:
+        return "🎵"
+    elif ext in ["pdf", "txt", "md", "doc", "docx"]:
+        return "📄"
+    elif ext in ["zip", "rar", "7z", "tar"]:
+        return "📦"
+    elif ext in ["py", "js", "html", "css", "json"]:
+        return "💻"
+    else:
+        return "📁"
 
 @app.get("/", response_class=HTMLResponse)
 def vault_grid_domu():
@@ -124,7 +146,7 @@ def vault_grid_domu():
     """
 
 @app.post("/dashboard", response_class=HTMLResponse)
-def dashboard(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/"), target_owner: str = Form(None)):
+def dashboard(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/"), target_owner: str = Form(None), view_trash: str = Form("false")):
     if not supabase:
         return "<h3 style='color:white;text-align:center;'>Chyba databáze!</h3><br><a href='/' class='btn'>Zpět</a>"
     
@@ -144,45 +166,106 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
     
     user = users[0]
     is_admin = (user["role"] == "admin")
-    
-    # Pokud je admin a chce prohlížet soubory někoho jiného
-    view_owner = username
-    if is_admin and target_owner:
-        view_owner = target_owner
+    view_owner = target_owner if (is_admin and target_owner) else username
 
-    # Načtení souborů
-    files_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("folder", current_folder).execute()
-    user_files = files_res.data
+    # Telemetrie: Výpočet zaplněného místa
+    all_user_files = supabase.table("nxt_files").select("size").eq("owner", view_owner).eq("is_deleted", False).execute().data
+    total_bytes = sum([f.get("size", 0) for f in all_user_files])
+    total_mb = round(total_bytes / (1024 * 1024), 2)
+
+    # Načtení dat podle toho, zda jsme v koši nebo ve složce
+    is_in_trash = (view_trash == "true")
     
+    if is_in_trash:
+        files_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", True).execute()
+    else:
+        files_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("folder", current_folder).eq("is_deleted", False).execute()
+    
+    items = files_res.data
+
+    # VFS: Oddělení složek a souborů pro aktuální adresář
+    folders_set = set()
+    files_list = []
+
+    for item in items:
+        if is_in_trash:
+            files_list.append(item)
+        else:
+            item_folder = item.get("folder", "/")
+            # Pokud item leží v podřízené složce, vytáhneme tuto složku pro navigaci
+            if item_folder.startswith(current_folder) and item_folder != current_folder:
+                rel_path = item_folder[len(current_folder):].strip("/")
+                if rel_path:
+                    sub_folder_name = rel_path.split("/")[0]
+                    full_sub_path = f"{current_folder.rstrip('/')}/{sub_folder_name}"
+                    folders_set.add(full_sub_path)
+            
+            # Pokud je item přímo v této složce
+            if item_folder == current_folder and not item['filename'].startswith(".slozkové_meta_"):
+                files_list.append(item)
+
+    # Render složek
+    folders_html = ""
+    for f_path in sorted(folders_set):
+        folder_name = f_path.split("/")[-1]
+        folders_html += f"""
+        <form action="/dashboard" method="POST" style="display:inline-block; margin-right: 10px;">
+            <input type="hidden" name="username" value="{username}">
+            <input type="hidden" name="password" value="{password}">
+            <input type="hidden" name="current_folder" value="{f_path}">
+            <input type="hidden" name="target_owner" value="{view_owner}">
+            <button type="submit" style="background: rgba(56, 189, 248, 0.2); border: 1px solid #38bdf8; color: #38bdf8; padding: 8px 15px; border-radius: 8px; cursor:pointer;">
+                📁 {folder_name}
+            </button>
+        </form>
+        """
+
+    # Render souborů
     files_html = ""
-    for f in user_files:
+    for f in files_list:
+        icon = get_file_icon(f['filename'])
+        if is_in_trash:
+            action_buttons = f"""
+                <a href="/restore-file?id={f['id']}&username={username}&password={password}&target_owner={view_owner}" class="file-link" style="color: #10b981;">Obnovit</a>
+                <a href="/delete-permanently?id={f['id']}&username={username}&password={password}&target_owner={view_owner}" class="delete-link">Smazat navždy</a>
+            """
+        else:
+            action_buttons = f"""
+                <a href="{f['file_url']}" download class="file-link">Stáhnout</a>
+                <a href="/delete-file?id={f['id']}&username={username}&password={password}&folder={current_folder}&target_owner={view_owner}" class="delete-link">Do koše</a>
+            """
+
         files_html += f"""
         <tr>
-            <td>📄 {f['filename']} <span style="font-size:11px; color:#64748b;">(vlastník: {f['owner']})</span></td>
-            <td>
-                <a href="{f['file_url']}" download class="file-link">Stáhnout</a>
-                <a href="/delete-file?id={f['id']}&username={username}&password={password}&folder={current_folder}&target_owner={view_owner}" class="delete-link">Smazat</a>
-            </td>
+            <td>{icon} {f['filename']}</td>
+            <td>{action_buttons}</td>
         </tr>
         """
     
-    if not files_html:
-        files_html = "<tr><td colspan='2' style='text-align:center; color:#64748b;'>V této složce nejsou žádné soubory.</td></tr>"
+    if not folders_html and not files_html:
+        files_html = "<tr><td colspan='2' style='text-align:center; color:#64748b;'>Tento adresář je prázdný.</td></tr>"
 
-    # Seznam všech uživatelů pro admin rozhraní
+    # Breadcrumbs (Drobečková navigace)
+    path_parts = current_folder.strip("/").split("/") if current_folder != "/" else []
+    breadcrumb_html = f"<a href='#' onclick='navigate(\"/\")' style='color:#38bdf8; text-decoration:none;'>🏠 Domů</a>"
+    built_path = ""
+    for part in path_parts:
+        if part:
+            built_path += f"/{part}"
+            breadcrumb_html += f" / <a href='#' onclick='navigate(\"{built_path}\")' style='color:#38bdf8; text-decoration:none;'>{part}</a>"
+
+    # Admin sekce
     admin_section = ""
     target_owner_selector = ""
     if is_admin:
         all_users_res = supabase.table("nxt_users").select("username, role").execute()
         all_users = all_users_res.data
-        
         users_rows = "".join([f"<tr><td>{u['username']}</td><td>{u['role']}</td></tr>" for u in all_users])
-        
-        # Výběr uživatele k prohlížení pro admina
         options_html = "".join([f"<option value='{u['username']}' {'selected' if u['username'] == view_owner else ''}>{u['username']}</option>" for u in all_users])
+        
         target_owner_selector = f"""
         <div class="box-section" style="border-color: rgba(56, 189, 248, 0.3);">
-            <p style="color:#38bdf8; margin-top:0;"><b>🛡️ Admin režim: Prohlížet úložiště uživatele</b></p>
+            <p style="color:#38bdf8; margin-top:0;"><b>🛡️ Admin režim: Správa úložiště uživatele</b></p>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
@@ -217,54 +300,101 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
         """
 
     return f"""
-    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid - {current_folder}</title>{VAULT_GRID_STYLE}</head>
+    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid OS - Dashboard</title>{VAULT_GRID_STYLE}
+    <script>
+        function navigate(path) {{
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/dashboard';
+            
+            const u = document.createElement('input'); u.type = 'hidden'; u.name = 'username'; u.value = '{username}';
+            const p = document.createElement('input'); p.type = 'hidden'; p.name = 'password'; p.value = '{password}';
+            const f = document.createElement('input'); f.type = 'hidden'; f.name = 'current_folder'; f.value = path;
+            const o = document.createElement('input'); o.type = 'hidden'; o.name = 'target_owner'; o.value = '{view_owner}';
+            
+            form.appendChild(u); form.appendChild(p); form.appendChild(f); form.appendChild(o);
+            document.body.appendChild(form);
+            form.submit();
+        }}
+    </script>
+    </head>
     <body>
         <div class="glass-dashboard">
-            <div class="badge">Přihlášen: {username} ({user['role']}) | Prohlížíte: {view_owner} | Složka: {current_folder}</div>
+            <div class="badge">Uživatel: {username} ({user['role']}) | Spravuje: {view_owner}</div>
             <h1>VaultGrid Storage OS ⚡</h1>
             
+            <!-- Telemetrie / Status panel -->
+            <div class="box-section" style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <p style="margin:0; color:#38bdf8;"><b>Stav serveru & Služeb</b></p>
+                    <span style="color: #10b981; font-size: 13px;">● Supabase Online</span> &nbsp;&nbsp; 
+                    <span style="color: #10b981; font-size: 13px;">● Hugging Face API Online</span>
+                </div>
+                <div style="width: 250px;">
+                    <p style="margin:0; font-size: 13px;">Využito místa: <b>{total_mb} MB</b></p>
+                    <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: {min(total_mb / 100, 100)}%;"></div></div>
+                </div>
+            </div>
+
             {target_owner_selector}
 
             <div class="box-section">
-                <p style="margin-top:0; color:#38bdf8;"><b>📁 Navigace a složky</b></p>
-                <p>Aktuální cesta: <b>{current_folder}</b></p>
-                
-                <form action="/dashboard" method="POST" style="display:inline-block; width: auto; margin-right: 5px;">
-                    <input type="hidden" name="username" value="{username}">
-                    <input type="hidden" name="password" value="{password}">
-                    <input type="hidden" name="current_folder" value="/">
-                    <input type="hidden" name="target_owner" value="{view_owner}">
-                    <button type="submit" style="padding: 8px 15px; margin:0; background: #334155; font-size:13px;">🏠 Domů (/)</button>
-                </form>
+                <div class="breadcrumb">Cesta: {breadcrumb_html}</div>
 
-                <!-- Rychlé vytvoření nové složky -->
-                <form action="/create-folder" method="POST" style="margin-top: 15px; display:flex; gap:10px;">
+                <div style="display:flex; gap: 10px; margin-bottom: 15px;">
+                    <form action="/dashboard" method="POST" style="margin:0;">
+                        <input type="hidden" name="username" value="{username}">
+                        <input type="hidden" name="password" value="{password}">
+                        <input type="hidden" name="current_folder" value="/">
+                        <input type="hidden" name="target_owner" value="{view_owner}">
+                        <input type="hidden" name="view_trash" value="{"true" if is_in_trash else "false"}">
+                        <button type="submit" style="margin:0; background: #334155; padding: 10px 15px;">🏠 Domů</button>
+                    </form>
+                    
+                    <form action="/dashboard" method="POST" style="margin:0;">
+                        <input type="hidden" name="username" value="{username}">
+                        <input type="hidden" name="password" value="{password}">
+                        <input type="hidden" name="current_folder" value="{current_folder}">
+                        <input type="hidden" name="target_owner" value="{view_owner}">
+                        <input type="hidden" name="view_trash" value="{"false" if is_in_trash else "true"}">
+                        <button type="submit" style="margin:0; background: {"#0284c7" if is_in_trash else "#334155"}; padding: 10px 15px;">🗑️ Koš</button>
+                    </form>
+                </div>
+
+                {"<!-- Skrýt tvoření složek v koši -->" if is_in_trash else f'''
+                <form action="/create-folder" method="POST" style="display:flex; gap:10px;">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="current_folder" value="{current_folder}">
                     <input type="hidden" name="target_owner" value="{view_owner}">
-                    <input type="text" name="new_folder_name" placeholder="Název nové složky (např. projekty)" required style="margin:0;">
+                    <input type="text" name="new_folder_name" placeholder="Název nové podsložky..." required style="margin:0;">
                     <button type="submit" style="margin:0; width: 180px; background: #0284c7;">+ Vytvořit složku</button>
                 </form>
+                '''}
             </div>
 
             <hr>
-            <h2>📂 Soubory ve složce {current_folder}</h2>
+            <h2>{"🗑️ Obsah Koše" if is_in_trash else f"📂 Složky a soubory v {current_folder}"}</h2>
+            
+            {"<div style='margin-bottom:15px;'>" + folders_html + "</div>" if not is_in_trash and folders_html else ""}
+
             <table>
-                <tr><th>Název souboru</th><th>Akce</th></tr>
+                <tr><th>Položka</th><th>Akce</th></tr>
                 {files_html}
             </table>
             
+            {"<!-- Skrýt nahrávání v koši -->" if is_in_trash else f'''
             <br>
             <form action="/upload" method="POST" enctype="multipart/form-data" class="box-section">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="folder" value="{current_folder}">
                 <input type="hidden" name="target_owner" value="{view_owner}">
-                <p style="margin-top:0; color:#38bdf8;"><b>📤 Nahrát soubor pro: {view_owner} do {current_folder}</b></p>
+                <p style="margin-top:0; color:#38bdf8;"><b>📤 Nahrát nový soubor do: {current_folder}</b></p>
                 <input type="file" name="file" required style="padding: 10px;">
                 <button type="submit">Nahrát do VaultGridu</button>
             </form>
+            '''}
 
             {admin_section}
             
@@ -285,14 +415,9 @@ def create_folder(username: str = Form(...), password: str = Form(...), current_
     
     clean_name = new_folder_name.strip().replace("/", "")
     if not clean_name:
-        return "Neplatný název složky"
+        return "Neplatný název"
     
-    if current_folder == "/":
-        new_path = f"/{clean_name}"
-    else:
-        new_path = f"{current_folder}/{clean_name}"
-
-    # Vytvoříme prázdný záchytný soubor (placeholder), aby složka v systému existovala
+    new_path = f"{current_folder.rstrip('/')}/{clean_name}"
     view_owner = target_owner if target_owner else username
     
     try:
@@ -301,21 +426,23 @@ def create_folder(username: str = Form(...), password: str = Form(...), current_
             "filename": f".slozkové_meta_{clean_name}",
             "storage_provider": "system",
             "file_url": "#",
-            "folder": new_path
+            "folder": new_path,
+            "size": 0,
+            "is_deleted": False
         }).execute()
-    except Exception as e:
+    except Exception:
         pass
 
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
         <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
-            <h2>Složka {new_path} vytvořena! 📁</h2>
+            <h2>Složka vytvořena! 📁</h2>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="current_folder" value="{new_path}">
                 <input type="hidden" name="target_owner" value="{view_owner}">
-                <button type="submit" class="btn">Vstoupit do složky</button>
+                <button type="submit" class="btn">Pokračovat</button>
             </form>
         </div>
     </body></html>
@@ -332,6 +459,7 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
     
     view_owner = target_owner if target_owner else username
     file_bytes = await file.read()
+    file_size = len(file_bytes)
     file_path_in_repo = f"{view_owner}{folder}/{file.filename}".replace("//", "/")
     
     try:
@@ -351,7 +479,9 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
             "filename": file.filename,
             "storage_provider": "huggingface",
             "file_url": public_url,
-            "folder": folder
+            "folder": folder,
+            "size": file_size,
+            "is_deleted": False
         }).execute()
         
     except Exception as e:
@@ -360,7 +490,7 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
         <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
-            <h2>Soubor nahrán do {folder}! 🎉</h2>
+            <h2>Soubor úspěšně nahrán! 🎉</h2>
             <p>{file.filename}</p>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{username}">
@@ -382,25 +512,74 @@ def delete_file(id: int, username: str, password: str, folder: str, target_owner
     if not res.data or res.data[0]["password"] != password:
         return "Neoprávněná akce!"
     
-    user = res.data[0]
     view_owner = target_owner if target_owner else username
-    
-    # Pokud je uživatel admin, může mazat cokoliv, běžný uživatel jen své
-    query = supabase.table("nxt_files").delete().eq("id", id)
-    if user["role"] != "admin":
-        query = query.eq("owner", username)
-    query.execute()
+    # Soft Delete -> Přesun do koše
+    supabase.table("nxt_files").update({"is_deleted": True}).eq("id", id).execute()
     
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
         <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
-            <h2>Položka smazána! 🗑️</h2>
+            <h2>Položka přesunuta do koše 🗑️</h2>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="current_folder" value="{folder}">
                 <input type="hidden" name="target_owner" value="{view_owner}">
-                <button type="submit" class="btn">Zpět do složky</button>
+                <button type="submit" class="btn">Zpět</button>
+            </form>
+        </div>
+    </body></html>
+    """
+
+@app.get("/restore-file", response_class=HTMLResponse)
+def restore_file(id: int, username: str, password: str, target_owner: str = None):
+    if not supabase:
+        return "Chyba"
+    res = supabase.table("nxt_users").select("*").eq("username", username).execute()
+    if not res.data or res.data[0]["password"] != password:
+        return "Neoprávněná akce!"
+    
+    view_owner = target_owner if target_owner else username
+    supabase.table("nxt_files").update({"is_deleted": False}).eq("id", id).execute()
+    
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
+        <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
+            <h2>Položka obnovena z koše! ✅</h2>
+            <form action="/dashboard" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="current_folder" value="/">
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <input type="hidden" name="view_trash" value="true">
+                <button type="submit" class="btn">Zpět do koše</button>
+            </form>
+        </div>
+    </body></html>
+    """
+
+@app.get("/delete-permanently", response_class=HTMLResponse)
+def delete_permanently(id: int, username: str, password: str, target_owner: str = None):
+    if not supabase:
+        return "Chyba"
+    res = supabase.table("nxt_users").select("*").eq("username", username).execute()
+    if not res.data or res.data[0]["password"] != password:
+        return "Neoprávněná akce!"
+    
+    view_owner = target_owner if target_owner else username
+    supabase.table("nxt_files").delete().eq("id", id).execute()
+    
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
+        <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
+            <h2>Položka definitivně smazána! ❌</h2>
+            <form action="/dashboard" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="current_folder" value="/">
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <input type="hidden" name="view_trash" value="true">
+                <button type="submit" class="btn">Zpět do koše</button>
             </form>
         </div>
     </body></html>
