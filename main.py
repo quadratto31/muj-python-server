@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="6.1")
+app = FastAPI(title="VaultGrid OS", version="7.0")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -39,7 +39,7 @@ VAULT_GRID_STYLE = """
         border-radius: 24px;
         padding: 30px;
         width: 100%;
-        max-width: 850px;
+        max-width: 900px;
         box-shadow: 0 25px 60px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.15);
     }
     h1, h2 { 
@@ -101,7 +101,7 @@ VAULT_GRID_STYLE = """
     a.file-link:hover { text-decoration: underline; }
     a.delete-link { color: #f87171; text-decoration: none; }
     a.delete-link:hover { text-decoration: underline; }
-    .toolbar { display: flex; gap: 10px; margin-top: 15px; background: rgba(15, 23, 42, 0.4); padding: 15px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.05); }
+    .box-section { background: rgba(15, 23, 42, 0.4); padding: 15px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.05); margin-top: 15px; }
     hr { border: 0; border-top: 1px solid rgba(255, 255, 255, 0.1); margin: 20px 0; }
 </style>
 """
@@ -112,19 +112,19 @@ def vault_grid_domu():
     <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid OS</title>{VAULT_GRID_STYLE}</head>
     <body>
         <div class="glass-dashboard" style="max-width: 450px;">
-            <h1>VaultGrid ⚡</h1>
-            <p style="text-align:center;">Profesionální cloudový serverový portál</p>
+            <h1>VaultGrid OS ⚡</h1>
+            <p style="text-align:center;">Přihlášení do zabezpečeného cloudu</p>
             <form action="/dashboard" method="POST">
                 <input type="text" name="username" placeholder="Uživatelské jméno" required>
                 <input type="password" name="password" placeholder="Heslo" required>
-                <button type="submit">Přihlásit se do systému</button>
+                <button type="submit">Vstoupit do systému</button>
             </form>
         </div>
     </body></html>
     """
 
 @app.post("/dashboard", response_class=HTMLResponse)
-def dashboard(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/")):
+def dashboard(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/"), target_owner: str = Form(None)):
     if not supabase:
         return "<h3 style='color:white;text-align:center;'>Chyba databáze!</h3><br><a href='/' class='btn'>Zpět</a>"
     
@@ -136,50 +136,78 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
         <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
             <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
                 <h2>Přístup odepřen</h2>
-                <p>Špatné jméno nebo heslo.</p>
+                <p>Nesprávné jméno nebo heslo.</p>
                 <a href="/" class="btn">Zpět</a>
             </div>
         </body></html>
         """
     
     user = users[0]
+    is_admin = (user["role"] == "admin")
     
-    files_res = supabase.table("nxt_files").select("*").eq("owner", username).eq("folder", current_folder).execute()
+    # Pokud je admin a chce prohlížet soubory někoho jiného
+    view_owner = username
+    if is_admin and target_owner:
+        view_owner = target_owner
+
+    # Načtení souborů
+    files_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("folder", current_folder).execute()
     user_files = files_res.data
     
     files_html = ""
     for f in user_files:
         files_html += f"""
         <tr>
-            <td>📄 {f['filename']}</td>
+            <td>📄 {f['filename']} <span style="font-size:11px; color:#64748b;">(vlastník: {f['owner']})</span></td>
             <td>
                 <a href="{f['file_url']}" download class="file-link">Stáhnout</a>
-                <a href="/delete-file?id={f['id']}&username={username}&password={password}&folder={current_folder}" class="delete-link">Smazat</a>
+                <a href="/delete-file?id={f['id']}&username={username}&password={password}&folder={current_folder}&target_owner={view_owner}" class="delete-link">Smazat</a>
             </td>
         </tr>
         """
     
     if not files_html:
-        files_html = "<tr><td colspan='2' style='text-align:center; color:#64748b;'>Tato složka je prázdná.</td></tr>"
+        files_html = "<tr><td colspan='2' style='text-align:center; color:#64748b;'>V této složce nejsou žádné soubory.</td></tr>"
 
+    # Seznam všech uživatelů pro admin rozhraní
     admin_section = ""
-    if user["role"] == "admin":
+    target_owner_selector = ""
+    if is_admin:
         all_users_res = supabase.table("nxt_users").select("username, role").execute()
-        users_rows = "".join([f"<tr><td>{u['username']}</td><td>{u['role']}</td></tr>" for u in all_users_res.data])
+        all_users = all_users_res.data
         
+        users_rows = "".join([f"<tr><td>{u['username']}</td><td>{u['role']}</td></tr>" for u in all_users])
+        
+        # Výběr uživatele k prohlížení pro admina
+        options_html = "".join([f"<option value='{u['username']}' {'selected' if u['username'] == view_owner else ''}>{u['username']}</option>" for u in all_users])
+        target_owner_selector = f"""
+        <div class="box-section" style="border-color: rgba(56, 189, 248, 0.3);">
+            <p style="color:#38bdf8; margin-top:0;"><b>🛡️ Admin režim: Prohlížet úložiště uživatele</b></p>
+            <form action="/dashboard" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="current_folder" value="{current_folder}">
+                <select name="target_owner" onchange="this.form.submit()">
+                    {options_html}
+                </select>
+            </form>
+        </div>
+        """
+
         admin_section = f"""
         <hr>
-        <h2>🛡️ VaultGrid Admin Panel</h2>
+        <h2>🛡️ VaultGrid Správa uživatelů</h2>
         <table>
             <tr><th>Uživatel</th><th>Role</th></tr>
             {users_rows}
         </table>
         <br>
-        <form action="/admin/add-user" method="POST">
+        <form action="/admin/add-user" method="POST" class="box-section">
             <input type="hidden" name="admin_user" value="{username}">
             <input type="hidden" name="admin_pass" value="{password}">
-            <input type="text" name="new_user" placeholder="Nové uživatelské jméno" required>
-            <input type="password" name="new_pass" placeholder="Heslo uživatele" required>
+            <p style="color:#38bdf8; margin-top:0;"><b>Vytvořit nového uživatele / udělit přístup</b></p>
+            <input type="text" name="new_user" placeholder="Uživatelské jméno" required>
+            <input type="password" name="new_pass" placeholder="Heslo" required>
             <select name="new_role">
                 <option value="uzivatel">Běžný uživatel</option>
                 <option value="admin">Administrátor</option>
@@ -192,47 +220,50 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
     <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid - {current_folder}</title>{VAULT_GRID_STYLE}</head>
     <body>
         <div class="glass-dashboard">
-            <div class="badge">Uživatel: {username} ({user['role']}) | Složka: {current_folder}</div>
+            <div class="badge">Přihlášen: {username} ({user['role']}) | Prohlížíte: {view_owner} | Složka: {current_folder}</div>
             <h1>VaultGrid Storage OS ⚡</h1>
             
-            <p>Aktuální cesta: <b>{current_folder}</b></p>
-            
-            <div class="toolbar">
-                <form action="/dashboard" method="POST" style="flex: 1; margin:0;">
+            {target_owner_selector}
+
+            <div class="box-section">
+                <p style="margin-top:0; color:#38bdf8;"><b>📁 Navigace a složky</b></p>
+                <p>Aktuální cesta: <b>{current_folder}</b></p>
+                
+                <form action="/dashboard" method="POST" style="display:inline-block; width: auto; margin-right: 5px;">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="current_folder" value="/">
-                    <button type="submit" style="margin:0; background: #334155;">📁 Kořenová složka (/)</button>
+                    <input type="hidden" name="target_owner" value="{view_owner}">
+                    <button type="submit" style="padding: 8px 15px; margin:0; background: #334155; font-size:13px;">🏠 Domů (/)</button>
                 </form>
-                <form action="/dashboard" method="POST" style="flex: 1; margin:0;">
+
+                <!-- Rychlé vytvoření nové složky -->
+                <form action="/create-folder" method="POST" style="margin-top: 15px; display:flex; gap:10px;">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
-                    <input type="hidden" name="current_folder" value="/dokumenty">
-                    <button type="submit" style="margin:0; background: #334155;">📁 /dokumenty</button>
-                </form>
-                <form action="/dashboard" method="POST" style="flex: 1; margin:0;">
-                    <input type="hidden" name="username" value="{username}">
-                    <input type="hidden" name="password" value="{password}">
-                    <input type="hidden" name="current_folder" value="/media">
-                    <button type="submit" style="margin:0; background: #334155;">📁 /media</button>
+                    <input type="hidden" name="current_folder" value="{current_folder}">
+                    <input type="hidden" name="target_owner" value="{view_owner}">
+                    <input type="text" name="new_folder_name" placeholder="Název nové složky (např. projekty)" required style="margin:0;">
+                    <button type="submit" style="margin:0; width: 180px; background: #0284c7;">+ Vytvořit složku</button>
                 </form>
             </div>
 
             <hr>
-            <h2>📂 Soubory v této složce</h2>
+            <h2>📂 Soubory ve složce {current_folder}</h2>
             <table>
                 <tr><th>Název souboru</th><th>Akce</th></tr>
                 {files_html}
             </table>
             
             <br>
-            <form action="/upload" method="POST" enctype="multipart/form-data" style="background: rgba(15, 23, 42, 0.4); padding: 15px; border-radius: 14px;">
+            <form action="/upload" method="POST" enctype="multipart/form-data" class="box-section">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="folder" value="{current_folder}">
-                <p style="margin-top:0; color:#38bdf8;">Nahrát do: {current_folder}</p>
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <p style="margin-top:0; color:#38bdf8;"><b>📤 Nahrát soubor pro: {view_owner} do {current_folder}</b></p>
                 <input type="file" name="file" required style="padding: 10px;">
-                <button type="submit">Nahrát soubor sem</button>
+                <button type="submit">Nahrát do VaultGridu</button>
             </form>
 
             {admin_section}
@@ -243,8 +274,55 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
     </body></html>
     """
 
+@app.post("/create-folder", response_class=HTMLResponse)
+def create_folder(username: str = Form(...), password: str = Form(...), current_folder: str = Form(...), new_folder_name: str = Form(...), target_owner: str = Form(None)):
+    if not supabase:
+        return "Chyba"
+    
+    res = supabase.table("nxt_users").select("*").eq("username", username).execute()
+    if not res.data or res.data[0]["password"] != password:
+        return "Neautorizováno"
+    
+    clean_name = new_folder_name.strip().replace("/", "")
+    if not clean_name:
+        return "Neplatný název složky"
+    
+    if current_folder == "/":
+        new_path = f"/{clean_name}"
+    else:
+        new_path = f"{current_folder}/{clean_name}"
+
+    # Vytvoříme prázdný záchytný soubor (placeholder), aby složka v systému existovala
+    view_owner = target_owner if target_owner else username
+    
+    try:
+        supabase.table("nxt_files").insert({
+            "owner": view_owner,
+            "filename": f".slozkové_meta_{clean_name}",
+            "storage_provider": "system",
+            "file_url": "#",
+            "folder": new_path
+        }).execute()
+    except Exception as e:
+        pass
+
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
+        <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
+            <h2>Složka {new_path} vytvořena! 📁</h2>
+            <form action="/dashboard" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="current_folder" value="{new_path}">
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <button type="submit" class="btn">Vstoupit do složky</button>
+            </form>
+        </div>
+    </body></html>
+    """
+
 @app.post("/upload", response_class=HTMLResponse)
-async def upload_file(username: str = Form(...), password: str = Form(...), folder: str = Form("/"), file: UploadFile = File(...)):
+async def upload_file(username: str = Form(...), password: str = Form(...), folder: str = Form("/"), target_owner: str = Form(None), file: UploadFile = File(...)):
     if not supabase:
         return "Chyba databáze"
     
@@ -252,8 +330,9 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
     if not res.data or res.data[0]["password"] != password:
         return "Neautorizováno"
     
+    view_owner = target_owner if target_owner else username
     file_bytes = await file.read()
-    file_path_in_repo = f"{username}{folder}/{file.filename}".replace("//", "/")
+    file_path_in_repo = f"{view_owner}{folder}/{file.filename}".replace("//", "/")
     
     try:
         if hf_api and HF_REPO_ID:
@@ -268,7 +347,7 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
             raise HTTPException(status_code=500, detail="Hugging Face není nastaven!")
         
         supabase.table("nxt_files").insert({
-            "owner": username,
+            "owner": view_owner,
             "filename": file.filename,
             "storage_provider": "huggingface",
             "file_url": public_url,
@@ -287,6 +366,7 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="current_folder" value="{folder}">
+                <input type="hidden" name="target_owner" value="{view_owner}">
                 <button type="submit" class="btn">Zpět do složky</button>
             </form>
         </div>
@@ -294,7 +374,7 @@ async def upload_file(username: str = Form(...), password: str = Form(...), fold
     """
 
 @app.get("/delete-file", response_class=HTMLResponse)
-def delete_file(id: int, username: str, password: str, folder: str):
+def delete_file(id: int, username: str, password: str, folder: str, target_owner: str = None):
     if not supabase:
         return "Chyba"
     
@@ -302,16 +382,24 @@ def delete_file(id: int, username: str, password: str, folder: str):
     if not res.data or res.data[0]["password"] != password:
         return "Neoprávněná akce!"
     
-    supabase.table("nxt_files").delete().eq("id", id).eq("owner", username).execute()
+    user = res.data[0]
+    view_owner = target_owner if target_owner else username
+    
+    # Pokud je uživatel admin, může mazat cokoliv, běžný uživatel jen své
+    query = supabase.table("nxt_files").delete().eq("id", id)
+    if user["role"] != "admin":
+        query = query.eq("owner", username)
+    query.execute()
     
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
         <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
-            <h2>Soubor smazán! 🗑️</h2>
+            <h2>Položka smazána! 🗑️</h2>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="hidden" name="current_folder" value="{folder}">
+                <input type="hidden" name="target_owner" value="{view_owner}">
                 <button type="submit" class="btn">Zpět do složky</button>
             </form>
         </div>
@@ -339,7 +427,7 @@ def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user:
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{VAULT_GRID_STYLE}</head><body>
         <div class="glass-dashboard" style="max-width: 400px; text-align:center;">
-            <h2>Uživatel {new_user} vytvořen! 🚀</h2>
+            <h2>Uživatel / přístup {new_user} úspěšně vytvořen! 🚀</h2>
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{admin_user}">
                 <input type="hidden" name="password" value="{admin_pass}">
