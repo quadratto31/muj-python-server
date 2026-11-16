@@ -2,17 +2,21 @@ import os
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
+from huggingface_hub import HfApi
 
-app = FastAPI(title="NXT Link", version="3.0")
+app = FastAPI(title="NXT Link", version="4.0")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = os.environ.get("HF_REPO_ID")
 
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Společný Liquid Glass design
+hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
+
 LIQUID_GLASS_STYLE = """
 <style>
     * { box-sizing: border-box; }
@@ -99,7 +103,6 @@ LIQUID_GLASS_STYLE = """
 </style>
 """
 
-# 1. PŘIHLAŠOVACÍ STRÁNKA
 @app.get("/", response_class=HTMLResponse)
 def nxt_link_domu():
     return f"""
@@ -107,7 +110,7 @@ def nxt_link_domu():
     <body>
         <div class="glass-card" style="max-width: 420px;">
             <h1>NXT Link 🌌</h1>
-            <p>Zabezpečený serverový portál</p>
+            <p>Zabezpečený serverový portál (10GB+ Hugging Face Storage)</p>
             <form action="/login" method="POST">
                 <input type="text" name="username" placeholder="Uživatelské jméno" required>
                 <input type="password" name="password" placeholder="Heslo" required>
@@ -117,7 +120,6 @@ def nxt_link_domu():
     </body></html>
     """
 
-# 2. PŘIHLÁŠENÍ A ROZCESTNÍK (Admin vs Uživatel)
 @app.post("/login", response_class=HTMLResponse)
 def login(username: str = Form(...), password: str = Form(...)):
     if not supabase:
@@ -139,7 +141,6 @@ def login(username: str = Form(...), password: str = Form(...)):
     
     user = users[0]
     
-    # Načtení souborů uživatele
     files_res = supabase.table("nxt_files").select("*").eq("owner", username).execute()
     user_files = files_res.data
     
@@ -150,7 +151,6 @@ def login(username: str = Form(...), password: str = Form(...)):
     if not files_html:
         files_html = "<tr><td colspan='2' style='text-align:center; color:#64748b;'>Zatím žádné soubory.</td></tr>"
 
-    # ADMIN PANEL (pokud je admin)
     admin_section = ""
     if user["role"] == "admin":
         all_users_res = supabase.table("nxt_users").select("username, role").execute()
@@ -181,7 +181,7 @@ def login(username: str = Form(...), password: str = Form(...)):
     <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>NXT Link - Portál</title>{LIQUID_GLASS_STYLE}</head>
     <body>
         <div class="glass-dashboard">
-            <div class="badge">Přihlášen jako: {username} ({user['role']})</div>
+            <div class="badge">Přihlášen jako: {username} ({user['role']}) | Úložiště: Hugging Face</div>
             <h1>NXT Link Dashboard 🚀</h1>
             
             <hr>
@@ -196,7 +196,7 @@ def login(username: str = Form(...), password: str = Form(...)):
                 <input type="hidden" name="username" value="{username}">
                 <input type="hidden" name="password" value="{password}">
                 <input type="file" name="file" required style="padding: 10px;">
-                <button type="submit">Nahrát nový soubor</button>
+                <button type="submit">Nahrát nový soubor (do Hugging Face)</button>
             </form>
 
             {admin_section}
@@ -207,40 +207,60 @@ def login(username: str = Form(...), password: str = Form(...)):
     </body></html>
     """
 
-# 3. NAHRÁVÁNÍ SOUBORŮ
 @app.post("/upload", response_class=HTMLResponse)
 async def upload_file(username: str = Form(...), password: str = Form(...), file: UploadFile = File(...)):
     if not supabase:
         return "Chyba databáze"
     
-    # Ověření relace
     res = supabase.table("nxt_users").select("*").eq("username", username).execute()
     if not res.data or res.data[0]["password"] != password:
         return "Neautorizováno"
     
     file_bytes = await file.read()
-    file_path = f"{username}/{file.filename}"
+    file_path_in_repo = f"{username}/{file.filename}"
     
-    # Nahrání do Supabase Storage bucketu 'nxt-storage'
     try:
-        supabase.storage.from_("nxt-storage").upload(file_path, file_bytes, file_options={"upsert": "true"})
-        public_url = supabase.storage.from_("nxt-storage").get_public_url(file_path)
+        if hf_api and HF_REPO_ID:
+            # Nahrání souboru na Hugging Face Dataset úložiště (10GB+ zdarma)
+            hf_api.upload_file(
+                path_or_fileobj=file_bytes,
+                path_in_repo=file_path_in_repo,
+                repo_id=HF_REPO_ID,
+                repo_type="dataset"
+            )
+            # Veřejný odkaz pro stažení ze serveru Hugging Face
+            public_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{file_path_in_repo}"
+            storage_provider = "huggingface"
+        else:
+            raise HTTPException(status_code=500, detail="Hugging Face API není nastaveno v proměnných prostředí!")
         
-        # Zápis do tabulky souborů
+        # Zápis metadat souboru do Supabase
         supabase.table("nxt_files").insert({
             "owner": username,
             "filename": file.filename,
-            "storage_provider": "supabase-storage",
+            "storage_provider": storage_provider,
             "file_url": public_url
         }).execute()
+        
     except Exception as e:
-        return f"Chyba při nahrávání: {str(e)}"
+        return f"""
+        <!DOCTYPE html><html lang="cs"><head>{LIQUID_GLASS_STYLE}</head><body>
+            <div class="glass-card" style="text-align:center;">
+                <h2>Chyba při nahrávání! ❌</h2>
+                <p>{str(e)}</p>
+                <form action="/login" method="POST">
+                    <input type="hidden" name="username" value="{username}">
+                    <input type="hidden" name="password" value="{password}">
+                    <button type="submit" class="btn">Zpět</button>
+                </form>
+            </div>
+        </body></html>
+        """
     
-    # Vrátíme uživatele zpět přes jednoduché přesměrování
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{LIQUID_GLASS_STYLE}</head><body>
         <div class="glass-card" style="text-align:center;">
-            <h2>Soubor úspěšně nahrán! 🎉</h2>
+            <h2>Soubor nahrán na Hugging Face! 🎉</h2>
             <p>{file.filename}</p>
             <form action="/login" method="POST">
                 <input type="hidden" name="username" value="{username}">
@@ -251,18 +271,15 @@ async def upload_file(username: str = Form(...), password: str = Form(...), file
     </body></html>
     """
 
-# 4. PŘIDÁNÍ NOVÉHO UŽIVATELE (Admin akce)
 @app.post("/admin/add-user", response_class=HTMLResponse)
 def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user: str = Form(...), new_pass: str = Form(...), new_role: str = Form(...)):
     if not supabase:
         return "Chyba"
     
-    # Ověření, že akci dělá admin
     res = supabase.table("nxt_users").select("*").eq("username", admin_user).execute()
     if not res.data or res.data[0]["password"] != admin_pass or res.data[0]["role"] != "admin":
         return "Neoprávněná akce!"
     
-    # Vložení nového uživatele do databáze
     try:
         supabase.table("nxt_users").insert({
             "username": new_user,
@@ -270,7 +287,7 @@ def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user:
             "role": new_role
         }).execute()
     except Exception as e:
-        return f"Chyba při vytváření uživatele (možná už jméno existuje): {str(e)}"
+        return f"Chyba: {str(e)}"
 
     return f"""
     <!DOCTYPE html><html lang="cs"><head>{LIQUID_GLASS_STYLE}</head><body>
