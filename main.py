@@ -785,3 +785,77 @@ def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user:
     try: supabase.table("nxt_users").insert({"username": new_user, "password": new_pass, "role": new_role}).execute()
     except Exception: pass
     return render_dashboard(admin_user, admin_pass, "/", None, "false")
+# --- VAULTGRID OS: ČÁST 7 (WebDAV Bridge & Online Code Editor) ---
+
+@app.get("/code-editor", response_class=HTMLResponse)
+def code_editor_view(id: int, username: str, password: str):
+    if not supabase: return "Chyba"
+    res = supabase.table("nxt_files").select("*").eq("id", id).execute()
+    if not res.data: return "Soubor nenalezen."
+    f_rec = res.data[0]
+    
+    import urllib.request
+    file_content = ""
+    try:
+        with urllib.request.urlopen(f_rec["file_url"]) as response:
+            file_content = response.read().decode('utf-8')
+    except Exception:
+        file_content = "// Nepodařilo se načíst obsah souboru."
+
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid - Code Editor</title>{VAULT_GRID_STYLE}</head>
+    <body>
+        <div class="glass-dashboard" style="max-width: 850px;">
+            <h2>💻 VS Code Editor: {f_rec['filename']}</h2>
+            <form action="/save-code" method="POST">
+                <input type="hidden" name="id" value="{id}">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="filename" value="{f_rec['filename']}">
+                <input type="hidden" name="folder" value="{f_rec['folder']}">
+                <textarea name="content" rows="15" style="width:100%; background: #0f172a; color: #00ff66; font-family: monospace; padding: 15px; border-radius: 10px; border: 1px solid #38bdf8; outline: none; font-size: 14px;">{file_content}</textarea>
+                <button type="submit" style="background: linear-gradient(135deg, #10b981, #059669); margin-top: 15px;">💾 Uložit změny do cloudu</button>
+            </form>
+            <br>
+            <a href="javascript:history.back()" class="btn" style="background: #334155;">Zpět</a>
+        </div>
+    </body></html>
+    """
+
+@app.post("/save-code", response_class=HTMLResponse)
+async def save_code(id: int = Form(...), username: str = Form(...), password: str = Form(...), filename: str = Form(...), folder: str = Form(...), content: str = Form(...)):
+    if not supabase: return "Chyba"
+    file_bytes = content.encode('utf-8')
+    file_path_in_repo = f"{username}{folder}/{filename}".replace("//", "/")
+    
+    if hf_api and HF_REPO_ID:
+        hf_api.upload_file(path_or_fileobj=file_bytes, path_in_repo=file_path_in_repo, repo_id=HF_REPO_ID, repo_type="dataset")
+        public_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{file_path_in_repo}"
+    else:
+        public_url = "#"
+    
+    # Aktualizace záznamu v databázi (vytvoří novou verzi)
+    supabase.table("nxt_files").insert({
+        "owner": username, "filename": filename, "storage_provider": "huggingface",
+        "file_url": public_url, "folder": folder, "size": len(file_bytes), "is_deleted": False
+    }).execute()
+    
+    return render_dashboard(username, password, folder, None, "false")
+
+@app.get("/network-drive", response_class=HTMLResponse)
+def network_drive_info(username: str, password: str):
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultGrid - Síťový disk</title>{VAULT_GRID_STYLE}</head>
+    <body>
+        <div class="glass-dashboard" style="max-width: 600px;">
+            <h2>🌐 WebDAV / Síťový disk (Bez práv v PC)</h2>
+            <div class="box-section">
+                <p style="color: #38bdf8; margin-top:0;"><b>Jak pracovat se soubory bez administrátora:</b></p>
+                <p>Protože Windows blokuje přímé WebDAV připojení bez administrátorských práv, VaultGrid má integrovanou rychlou webovou správu a <b>přímé stahování/nahrávání</b> v každé složce. Můžeš sem nahrávat celé složky nebo soubory přetahováním.</p>
+                <p>Pro rychlý přístup z mobilu nebo jiného zařízení ti stačí otevřít adresu tvé Render aplikace v libovolném prohlížeči!</p>
+            </div>
+            <br>
+            <a href="javascript:history.back()" class="btn" style="background: #334155;">Zpět do úložiště</a>
+        </div>
+    </body></html>
+    """
