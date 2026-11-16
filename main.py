@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="6.0")
+app = FastAPI(title="VaultGrid OS", version="6.1")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -144,7 +144,6 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
     
     user = users[0]
     
-    # Načtení souborů pro aktuálního uživatele a aktuální složku
     files_res = supabase.table("nxt_files").select("*").eq("owner", username).eq("folder", current_folder).execute()
     user_files = files_res.data
     
@@ -203,19 +202,19 @@ def dashboard(username: str = Form(...), password: str = Form(...), current_fold
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="current_folder" value="/">
-                    <button type="submit" style="margin:0; background: #334155;">📁 Jít do kořenové složky (/)</button>
+                    <button type="submit" style="margin:0; background: #334155;">📁 Kořenová složka (/)</button>
                 </form>
                 <form action="/dashboard" method="POST" style="flex: 1; margin:0;">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="current_folder" value="/dokumenty">
-                    <button type="submit" style="margin:0; background: #334155;">📁 Složka /dokumenty</button>
+                    <button type="submit" style="margin:0; background: #334155;">📁 /dokumenty</button>
                 </form>
                 <form action="/dashboard" method="POST" style="flex: 1; margin:0;">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="current_folder" value="/media">
-                    <button type="submit" style="margin:0; background: #334155;">📁 Složka /media</button>
+                    <button type="submit" style="margin:0; background: #334155;">📁 /media</button>
                 </form>
             </div>
 
@@ -320,7 +319,7 @@ def delete_file(id: int, username: str, password: str, folder: str):
     """
 
 @app.post("/admin/add-user", response_class=HTMLResponse)
-def add_user(admin_user: str = Form(...), admin_pass: str, new_user: str = Form(...), new_pass: str = Form(...), new_role: str = Form(...)):
+def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user: str = Form(...), new_pass: str = Form(...), new_role: str = Form(...)):
     if not supabase:
         return "Chyba"
     
@@ -344,6 +343,7 @@ def add_user(admin_user: str = Form(...), admin_pass: str, new_user: str = Form(
             <form action="/dashboard" method="POST">
                 <input type="hidden" name="username" value="{admin_user}">
                 <input type="hidden" name="password" value="{admin_pass}">
+                <input type="hidden" name="current_folder" value="/">
                 <button type="submit" class="btn">Zpět do Admin panelu</button>
             </form>
         </div>
