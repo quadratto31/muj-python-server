@@ -1,10 +1,11 @@
 import os
+import urllib.request
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="12.0")
+app = FastAPI(title="VaultGrid OS", version="13.0")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -230,7 +231,7 @@ def terminal_view(username: str, current_folder: str, history: str):
     <body>
         <div class="terminal-window">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                <span>⚡ VaultGrid OS [Version 12.0-ROOT]</span>
+                <span>⚡ VaultGrid OS [Version 13.0-ROOT]</span>
                 <form action="/" method="GET" style="margin:0;"><button type="submit" class="logout-btn">Odhlásit</button></form>
             </div>
             <div class="terminal-output" id="output">{history}</div>
@@ -360,6 +361,10 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
         if ext in ["mp4", "mov", "avi", "webm", "mp3", "wav"]:
             media_btn = f'<a href="/media-player?file_url={f["file_url"]}&filename={f["filename"]}" class="file-link" style="color: #f59e0b;">Přehrát</a>'
 
+        live_html_btn = ""
+        if ext == "html":
+            live_html_btn = f'<a href="/live?id={f["id"]}" target="_blank" class="file-link" style="color: #ec4899;">Živý web</a>'
+
         if is_in_trash:
             action_buttons = f"""
                 <a href="/restore-file?id={f['id']}&username={username}&password={password}&target_owner={view_owner}" class="file-link" style="color: #10b981;">Obnovit</a>
@@ -369,6 +374,7 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
             action_buttons = f"""
                 <a href="{f['file_url']}" download class="file-link">Stáhnout</a>
                 {media_btn}
+                {live_html_btn}
                 <a href="/share?id={f['id']}" target="_blank" class="file-link" style="color: #10b981;">Sdílet</a>
                 <a href="/ai-analyze?id={f['id']}" class="file-link" style="color: #a855f7;">AI analýza</a>
                 <a href="/file-versions?filename={f['filename']}&username={view_owner}" class="file-link" style="color: #38bdf8;">Verze</a>
@@ -509,7 +515,7 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
 def dashboard_render_route(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/"), target_owner: str = Form(None), view_trash: str = Form("false")):
     return render_dashboard(username, password, current_folder, target_owner, view_trash)
 
-# --- MODULY: SDÍLENÍ, MÉDIA, AI, VERZE, KOMENTÁŘE, STATISTIKY ---
+# --- MODULY: SDÍLENÍ, MÉDIA, ŽIVÝ HTML HOSTING, AI, VERZE, KOMENTÁŘE, STATISTIKY ---
 @app.get("/share", response_class=HTMLResponse)
 def share_file(id: int):
     if not supabase: return "Chyba databáze"
@@ -526,6 +532,26 @@ def share_file(id: int):
         </div>
     </body></html>
     """
+
+@app.get("/live", response_class=HTMLResponse)
+async def live_html_preview(id: int):
+    if not supabase: return "Chyba databáze"
+    res = supabase.table("nxt_files").select("*").eq("id", id).execute()
+    if not res.data: return "Soubor nenalezen."
+    
+    file_record = res.data[0]
+    file_url = file_record["file_url"]
+    filename = file_record["filename"]
+    
+    if not filename.endswith(".html"):
+        return f"Tento soubor ({filename}) není HTML stránka a nelze ho spustit jako živý web."
+    
+    try:
+        with urllib.request.urlopen(file_url) as response:
+            html_content = response.read().decode('utf-8')
+        return HTMLResponse(content=html_content, status_code=200)
+    except Exception as e:
+        return f"Chyba při načítání živé stránky: {e}"
 
 @app.get("/media-player", response_class=HTMLResponse)
 def media_player(file_url: str, filename: str):
