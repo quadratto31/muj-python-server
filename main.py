@@ -1,26 +1,19 @@
 import os
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 from supabase import create_client, Client
-from huggingface_hub import HfApi
 
 app = FastAPI(title="NXT Link", version="1.0")
 
-# Připojení ke Supabase (pro uživatele a metadata souborů)
+# Připojení ke Supabase
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-# Hugging Face Token (pro velkého úložiště zdarma - 10GB+)
-HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_REPO_ID = os.environ.get("HF_REPO_ID") # např. "tvoje-jmeno/nxt-link-storage"
 
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
-
-# --- HTML ÚVODNÍ PORTÁL S ADMINEM ---
+# --- PORTÁL NXT LINK ---
 @app.get("/", response_class=HTMLResponse)
 def nxt_link_domu():
     return """
@@ -28,7 +21,7 @@ def nxt_link_domu():
     <html lang="cs">
     <head>
         <meta charset="UTF-8">
-        <title>NXT Link - Portál</>
+        <title>NXT Link - Portál</title>
         <style>
             body { font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; padding: 40px; }
             .card { background: #1e293b; padding: 30px; border-radius: 12px; max-width: 500px; margin: auto; box-shadow: 0 10px 25px rgba(0,0,0,0.3); }
@@ -42,7 +35,7 @@ def nxt_link_domu():
     <body>
         <div class="card">
             <h1>NXT Link 🚀</h1>
-            <p style="text-align: center; color: #94a3b8;">Vítej v souborovém portálu</p>
+            <p style="text-align: center; color: #94a3b8;">Přihlášení do souborového portálu</p>
             <form action="/login" method="POST">
                 <input type="text" name="username" placeholder="Uživatelské jméno" required>
                 <input type="password" name="password" placeholder="Heslo" required>
@@ -53,29 +46,27 @@ def nxt_link_domu():
     </html>
     """
 
-@app.post("/login")
+@app.post("/login", response_class=HTMLResponse)
 def login(username: str = Form(...), password: str = Form(...)):
     if not supabase:
-        raise HTTPException(status_code=500, detail="Chybí Supabase připojení")
+        return "<h3>Chyba: Supabase není připojena!</h3><a href='/'>Zpět</a>"
     
-    # Ověření uživatele v databázi
     res = supabase.table("nxt_users").select("*").eq("username", username).execute()
     users = res.data
     
     if not users or users[0]["password"] != password:
-        return HTMLResponse("<h3>Nesprávné jméno nebo heslo!</h3><a href='/'>Zpět</a>", status_code=400)
+        return "<h3>Nesprávné jméno nebo heslo!</h3><a href='/'>Zpět</a>"
     
     user = users[0]
     if user["role"] == "admin":
-        return HTMLResponse(f"<h1>Vítej Admini, {username}!</h1><p>Tady bude správa uživatelů a složek.</p><a href='/'>Odhlásit</a>")
+        return f"<h1>Vítej šéfe (Admin), {username}!</h1><p>Tady bude administrace uživatelů.</p><a href='/'>Odhlásit</a>"
     else:
-        return HTMLResponse(f"<h1>Vítej uživateli, {username}!</h1><p>Tohle je tvá soukromá složka.</p><a href='/'>Odhlásit</a>")
+        return f"<h1>Vítej uživateli, {username}!</h1><p>Tohle je tvůj osobní prostor.</p><a href='/'>Odhlásit</a>"
 
 @app.get("/api/stav")
 def stav_serveru():
     return {
         "projekt": "NXT Link",
         "stav": "Běží stabilně",
-        "supabase": supabase is not None,
-        "velke_uloziste_aktivni": hf_api is not None
+        "supabase_pripojeno": supabase is not None
     }
