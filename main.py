@@ -4,14 +4,14 @@ import html
 import shutil
 import platform
 import urllib.request
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Request
 from fastapi.responses import HTMLResponse
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="17.0")
+app = FastAPI(title="VaultGrid OS", version="18.0")
 
-CORE_VERSION = "17.0"
+CORE_VERSION = "18.0"
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -173,6 +173,11 @@ VAULT_GRID_STYLE = """
         color: #f8fafc;
         border-bottom-left-radius: 4px;
     }
+    .form-grid-2 {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 10px;
+    }
 </style>
 """
 
@@ -263,20 +268,23 @@ def is_system_record(item: dict) -> bool:
         or fname.startswith(".vault_")
     )
 
-# --- OTA ENGINE: DYNAMICKÉ NAČÍTÁNÍ MODULŮ ---
+# --- OTA ENGINE: DYNAMICKÉ NAČÍTÁNÍ A PUBLIKOVÁNÍ MODULŮ ---
 def sync_ota_modules_from_db():
     if not supabase:
         return
     try:
         res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_ota_module").eq("is_deleted", False).execute()
+        active_names = set()
         for row in (res.data or []):
             mod_name = row.get("filename", "")
+            active_names.add(mod_name)
             meta_raw = row.get("file_url", "{}")
             try:
                 meta = json.loads(meta_raw)
                 code_url = meta.get("code_url", "")
-                if mod_name and code_url and mod_name not in LOADED_OTA_MODULES:
-                    with urllib.request.urlopen(code_url) as resp:
+                if mod_name and code_url and (mod_name not in LOADED_OTA_MODULES or LOADED_OTA_MODULES[mod_name].get("version") != meta.get("version")):
+                    req = urllib.request.Request(code_url, headers={"Cache-Control": "no-cache"})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
                         code_str = resp.read().decode("utf-8")
                     LOADED_OTA_MODULES[mod_name] = {
                         "title": meta.get("title", mod_name),
@@ -287,6 +295,9 @@ def sync_ota_modules_from_db():
                     }
             except Exception:
                 pass
+        for stale in list(LOADED_OTA_MODULES.keys()):
+            if stale not in active_names:
+                del LOADED_OTA_MODULES[stale]
     except Exception:
         pass
 
@@ -294,7 +305,7 @@ def get_installed_ota_version() -> str:
     sync_ota_modules_from_db()
     if not LOADED_OTA_MODULES:
         return CORE_VERSION
-    versions = [m.get("version", CORE_VERSION) for m in LOADED_OTA_MODULES.values()]
+    versions = [str(m.get("version", CORE_VERSION)) for m in LOADED_OTA_MODULES.values()]
     return max(versions + [CORE_VERSION])
 
 def fetch_remote_manifest() -> dict | None:
@@ -321,7 +332,7 @@ def vault_grid_domu():
     <body>
         <div class="glass-dashboard" style="max-width: 450px;">
             <h1>VaultGrid OS ⚡</h1>
-            <p style="text-align:center;">Cloud OS v{active_ver} OTA (terminál: root / root)</p>
+            <p style="text-align:center;">Cloud OS v{active_ver} OTA Studio (terminál: root / root)</p>
             <form action="/login-router" method="POST">
                 <input type="text" name="username" placeholder="Uživatelské jméno" required>
                 <input type="password" name="password" placeholder="Heslo" required>
@@ -401,7 +412,7 @@ def terminal_exec(username: str = Form(...), current_folder: str = Form(...), hi
             rem_ver = manifest.get("version", active_ver)
             new_history += f"  [VaultUpdate] Dostupná verze na Hugging Face: v{rem_ver}\n"
             new_history += f"  [VaultUpdate] Poznámky: {manifest.get('notes', '')}\n"
-            new_history += "  Pro instalaci otevři v dashboardu aplikaci 'VaultUpdate'.\n\n"
+            new_history += "  Pro instalaci nebo publikování nových modulů otevři 'VaultUpdate'.\n\n"
         else:
             new_history += "  [VaultUpdate] Nebyl nalezen vzdálený manifest (vše aktuální).\n\n"
     elif action == "neofetch":
@@ -412,7 +423,7 @@ def terminal_exec(username: str = Form(...), current_folder: str = Form(...), hi
             "  | | / / __ `/ / / / / __/ / __/ ___/ / __  / \n"
             "  | |/ / /_/ / /_/ / / /_/ /_/ / /  / / /_/ /  \n"
             "  |___/\\__,_/\\__,_/_/\\__/\\____/_/  /_/\\__,_/   \n"
-            f"  OS: VaultGrid OS v{active_ver} OTA Kernel\n"
+            f"  OS: VaultGrid OS v{active_ver} OTA Studio Kernel\n"
             f"  Host Kernel: {platform.system()} {platform.release()}\n"
             f"  OTA Modules: {len(LOADED_OTA_MODULES)} aktivních rozšíření\n"
             f"  Apps: VaultFlix, VaultBeats, VaultChat, VaultUpdate\n\n"
@@ -455,7 +466,7 @@ def terminal_exec(username: str = Form(...), current_folder: str = Form(...), hi
                 new_history += f"  - {u['username']} ({u['role']})\n"
         new_history += "\n"
     elif action == "status":
-        new_history += "  Server: Online (Render Cloud)\n  Database: Supabase Connected\n  OTA Engine: Active (Hugging Face + Supabase Sync)\n  Security: VaultShield PIN Lock Active\n\n"
+        new_history += "  Server: Online (Render Cloud)\n  Database: Supabase Connected\n  OTA Studio: Active (Hugging Face + Supabase Sync)\n  Security: VaultShield PIN Lock Active\n\n"
     elif action == "cd":
         if len(parts) > 1:
             target = parts[1]
@@ -746,7 +757,7 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
                 <a href="/vaultupdate?username={username}&password={password}&target_owner={view_owner}" class="app-card" style="border-color: rgba(16, 185, 129, 0.5);">
                     <span class="app-icon">🔄</span>
                     <span class="app-title" style="color: #34d399;">VaultUpdate</span>
-                    <span class="app-sub">Aktualizace OS</span>
+                    <span class="app-sub">OTA Studio & Update</span>
                 </a>
                 {ota_dock_cards}
             </div>
@@ -755,7 +766,7 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
                 <div>
                     <p style="margin:0; color:#38bdf8;"><b>Stav serveru & Služeb</b></p>
                     <span style="color: #10b981; font-size: 13px;">● Supabase Online</span> &nbsp;&nbsp; 
-                    <span style="color: #10b981; font-size: 13px;">● OTA Update Engine Ready</span>
+                    <span style="color: #10b981; font-size: 13px;">● OTA Studio Ready</span>
                 </div>
                 <div style="width: 250px;">
                     <p style="margin:0; font-size: 13px;">Využito místa: <b>{total_mb} MB</b></p>
@@ -820,7 +831,7 @@ def render_dashboard(username, password, current_folder, target_owner, view_tras
 def dashboard_render_route(username: str = Form(...), password: str = Form(...), current_folder: str = Form("/"), target_owner: str = Form(None), view_trash: str = Form("false"), unlocked_pin: str = Form("")):
     return render_dashboard(username, password, current_folder, target_owner, view_trash, unlocked_pin)
 
-# --- VAULTUPDATE (WINDOWS UPDATE STYL AKTUALIZACÍ BEZ ÚPRAVY MAIN.PY) ---
+# --- VAULTUPDATE & OTA STUDIO (PUBLIKOVÁNÍ I INSTALACE PŘÍMO Z PROHLÍŽEČE) ---
 @app.get("/vaultupdate", response_class=HTMLResponse)
 def vaultupdate_view(username: str, password: str, target_owner: str = None, status_msg: str = ""):
     sync_ota_modules_from_db()
@@ -832,16 +843,37 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
     remote_ver = active_ver
     update_notes = "Žádné nové aktualizace nebyly nalezeny."
     if manifest:
-        remote_ver = manifest.get("version", active_ver)
+        remote_ver = str(manifest.get("version", active_ver))
         update_notes = manifest.get("notes", "")
-        if remote_ver != active_ver or "vaultnotes" not in LOADED_OTA_MODULES:
+        remote_modules = manifest.get("modules", [])
+        for rm in remote_modules:
+            rname = rm.get("name")
+            rver = str(rm.get("version", ""))
+            if rname and (rname not in LOADED_OTA_MODULES or str(LOADED_OTA_MODULES[rname].get("version", "")) != rver):
+                has_update = True
+        if remote_ver != active_ver:
             has_update = True
 
     installed_list_html = ""
     for k, m in LOADED_OTA_MODULES.items():
-        installed_list_html += f"<tr><td>{m['icon']} <b>{m['title']}</b> ({k})</td><td>v{m['version']}</td><td style='color:#4ade80;'>● Aktivní v jádře</td></tr>"
+        installed_list_html += f"""
+        <tr>
+            <td>{m['icon']} <b>{m['title']}</b> (<code>{k}</code>)</td>
+            <td>v{m['version']}</td>
+            <td style='color:#4ade80;'>● Aktivní v jádře</td>
+            <td>
+                <form action="/vaultupdate/uninstall" method="POST" style="margin:0;">
+                    <input type="hidden" name="username" value="{username}">
+                    <input type="hidden" name="password" value="{password}">
+                    <input type="hidden" name="target_owner" value="{view_owner}">
+                    <input type="hidden" name="module_name" value="{k}">
+                    <button type="submit" style="margin:0; padding:6px 10px; background:#dc2626; font-size:12px; width:auto;">Odinstalovat</button>
+                </form>
+            </td>
+        </tr>
+        """
     if not installed_list_html:
-        installed_list_html = "<tr><td colspan='3' style='text-align:center; color:#64748b;'>Zatím nejsou nainstalovány žádné rozšiřující OTA balíčky.</td></tr>"
+        installed_list_html = "<tr><td colspan='4' style='text-align:center; color:#64748b;'>Zatím nejsou nainstalovány žádné rozšiřující OTA balíčky.</td></tr>"
 
     update_card_html = ""
     if has_update:
@@ -865,38 +897,107 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
         update_card_html = f"""
         <div class="box-section" style="border-color: rgba(56, 189, 248, 0.3);">
             <h3 style="color: #4ade80; margin-top: 0; text-align: left;">✅ Váš systém je aktuální (Verze {active_ver})</h3>
-            <p>Všechny dostupné aktualizace a moduly jsou nainstalovány. Nové verze se stahují z Hugging Face repozitáře <b>{HF_REPO_ID or 'nenastaveno'}</b>.</p>
+            <p>Všechny dostupné aktualizace a moduly jsou nainstalovány. Repozitář: <b>{HF_REPO_ID or 'nenastaveno'}</b>.</p>
             <a href="/vaultupdate?username={username}&password={password}&target_owner={view_owner}" class="btn" style="background: #0284c7; width: auto; padding: 10px 20px;">🔍 Znovu vyhledat aktualizace</a>
         </div>
         """
 
+    starter_ota_code = '''def render(username, password, view_owner, supabase, action_data):
+    a = action_data.get("num_a", "")
+    b = action_data.get("num_b", "")
+    op = action_data.get("op", "+")
+    vysledek = ""
+    if a != "" and b != "":
+        try:
+            fa, fb = float(a), float(b)
+            if op == "+": vysledek = f"{fa + fb:g}"
+            elif op == "-": vysledek = f"{fa - fb:g}"
+            elif op == "*": vysledek = f"{fa * fb:g}"
+            elif op == "/": vysledek = f"{fa / fb:g}" if fb != 0 else "Nelze dělit nulou"
+        except Exception:
+            vysledek = "Neplatné číslo"
+
+    return f"""
+    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultCalc OTA</title>{VAULT_GRID_STYLE}</head>
+    <body>
+        <div class="glass-dashboard" style="max-width: 520px; border-color: rgba(56, 189, 248, 0.45);">
+            <div class="badge">Vlastní OTA Aplikace</div>
+            <h1>🧮 VaultCalc</h1>
+            <form action="/ota-app/vaultcalc" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <input type="number" step="any" name="num_a" placeholder="První číslo" value="{html.escape(str(a))}" required>
+                <select name="op">
+                    <option value="+" {"selected" if op=="+" else ""}>+ Sčítání</option>
+                    <option value="-" {"selected" if op=="-" else ""}>- Odčítání</option>
+                    <option value="*" {"selected" if op=="*" else ""}>* Násobení</option>
+                    <option value="/" {"selected" if op=="/" else ""}>/ Dělení</option>
+                </select>
+                <input type="number" step="any" name="num_b" placeholder="Druhé číslo" value="{html.escape(str(b))}" required>
+                <button type="submit">Vypočítat</button>
+            </form>
+            {f"<div class='box-section' style='text-align:center; font-size:20px; color:#4ade80;'>Výsledek: <b>{vysledek}</b></div>" if vysledek != "" else ""}
+            <br>
+            <form action="/dashboard-render" method="POST">
+                <input type="hidden" name="username" value="{username}">
+                <input type="hidden" name="password" value="{password}">
+                <input type="hidden" name="target_owner" value="{view_owner}">
+                <button type="submit" style="background: #334155;">⬅ Zpět do správce souborů</button>
+            </form>
+        </div>
+    </body></html>
+    """'''
+
     banner = f"<div class='box-section' style='border-color:#38bdf8; color:#38bdf8; text-align:center;'><b>{html.escape(status_msg)}</b></div>" if status_msg else ""
 
     return f"""
-    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultUpdate - Aktualizace systému</title>{VAULT_GRID_STYLE}</head>
+    <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultUpdate & OTA Studio</title>{VAULT_GRID_STYLE}</head>
     <body>
-        <div class="glass-dashboard" style="max-width: 850px; border-color: rgba(16, 185, 129, 0.4);">
-            <h1 style="color: #34d399;">🔄 VaultUpdate – Centrum aktualizací</h1>
-            <p style="text-align:center;">Aktualizace funkcí a modulů přes Hugging Face bez zásahu do main.py</p>
+        <div class="glass-dashboard" style="max-width: 920px; border-color: rgba(16, 185, 129, 0.4);">
+            <h1 style="color: #34d399;">🔄 VaultUpdate & OTA Studio</h1>
+            <p style="text-align:center;">Vytvářej, publikuj a instaluj nové aplikace do VaultGrid OS přímo z prohlížeče</p>
             {banner}
             {update_card_html}
 
             <div class="box-section">
                 <h3 style="margin-top:0; text-align:left;">📦 Nainstalované OTA moduly v paměti</h3>
                 <table>
-                    <tr><th>Modul</th><th>Verze</th><th>Stav</th></tr>
+                    <tr><th>Modul</th><th>Verze</th><th>Stav</th><th>Akce</th></tr>
                     {installed_list_html}
                 </table>
             </div>
 
+            <!-- OTA STUDIO: PUBLIKOVÁNÍ VLASTNÍCH AKTUALIZACÍ PŘÍMO Z VAULTGRIDU -->
+            <div class="box-section" style="border-color: rgba(168, 85, 247, 0.45); background: rgba(30, 27, 75, 0.35);">
+                <h3 style="color: #c084fc; margin-top:0; text-align:left;">🛠️ OTA Studio – Napsat a publikovat novou aktualizaci</h3>
+                <p>Vyplň údaje a kód aplikace níže. VaultGrid soubor automaticky nahraje do <code>system_ota/</code> na Hugging Face a aktualizuje <code>manifest.json</code>.</p>
+                <form action="/vaultupdate/publish-custom" method="POST">
+                    <input type="hidden" name="username" value="{username}">
+                    <input type="hidden" name="password" value="{password}">
+                    <input type="hidden" name="target_owner" value="{view_owner}">
+                    <div class="form-grid-2">
+                        <input type="text" name="mod_name" placeholder="ID modulu bez mezer (např. vaultcalc)" value="vaultcalc" required>
+                        <input type="text" name="mod_title" placeholder="Název v docku (např. VaultCalc)" value="VaultCalc" required>
+                        <input type="text" name="mod_icon" placeholder="Ikona emoji (např. 🧮)" value="🧮" required>
+                        <input type="text" name="mod_sub" placeholder="Krátký podtitul (např. Kalkulačka)" value="OTA Kalkulačka" required>
+                        <input type="text" name="new_version" placeholder="Nová verze OS (např. 18.1)" value="18.1" required>
+                        <input type="text" name="release_notes" placeholder="Popis aktualizace (Changelog)" value="Přidána aplikace VaultCalc přes OTA Studio." required>
+                    </div>
+                    <p style="margin: 8px 0 4px 0; color: #c084fc; font-size: 13px;"><b>Python kód modulu (musí obsahovat funkci <code>render(username, password, view_owner, supabase, action_data)</code>):</b></p>
+                    <textarea name="module_code" rows="15" style="background: #090d16; color: #00ff66; font-family: 'Courier New', monospace; line-height: 1.45;" required>{html.escape(starter_ota_code)}</textarea>
+                    <button type="submit" style="background: linear-gradient(135deg, #9333ea, #6d28d9);">🚀 Publikovat aktualizaci na Hugging Face</button>
+                </form>
+            </div>
+
             <div class="box-section" style="border-color: rgba(245, 158, 11, 0.35);">
-                <h3 style="color: #fbbf24; margin-top:0; text-align:left;">🧪 Testovací režim: Nasimulovat vydání nové verze v17.1</h3>
-                <p>Kliknutím níže nahraješ na svůj Hugging Face server nový OTA balíček (<b>VaultNotes Pro – cloudový poznámkový blok</b>) a manifest <code>system_ota/manifest.json</code>. Poté ho uvidíš výše a nainstaluješ ho jako ve Windows Update.</p>
+                <h3 style="color: #fbbf24; margin-top:0; text-align:left;">⚡ Rychlý test: Vydat balíček VaultNotes Pro (Poznámky)</h3>
+                <p>Jedním kliknutím vygeneruje a odešle na Hugging Face hotovou aplikaci <b>VaultNotes Pro</b>.</p>
                 <form action="/vaultupdate/publish-demo" method="POST">
                     <input type="hidden" name="username" value="{username}">
                     <input type="hidden" name="password" value="{password}">
                     <input type="hidden" name="target_owner" value="{view_owner}">
-                    <button type="submit" style="background: linear-gradient(135deg, #d97706, #b45309);">🚀 Vydat testovací OTA balíček v17.1 na Hugging Face</button>
+                    <button type="submit" style="background: linear-gradient(135deg, #d97706, #b45309);">📝 Publikovat hotový balíček VaultNotes Pro</button>
                 </form>
             </div>
 
@@ -926,11 +1027,68 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
                         clearInterval(iv);
                         document.getElementById('install-ota-form').submit();
                     }}
-                }}, 250);
+                }}, 220);
             }}
         </script>
     </body></html>
     """
+
+@app.post("/vaultupdate/publish-custom", response_class=HTMLResponse)
+def vaultupdate_publish_custom(
+    username: str = Form(...),
+    password: str = Form(...),
+    target_owner: str = Form(None),
+    mod_name: str = Form(...),
+    mod_title: str = Form(...),
+    mod_icon: str = Form(...),
+    mod_sub: str = Form(...),
+    new_version: str = Form(...),
+    release_notes: str = Form(...),
+    module_code: str = Form(...)
+):
+    view_owner = target_owner if target_owner else username
+    if not (hf_api and HF_REPO_ID):
+        return vaultupdate_view(username, password, view_owner, "❌ Chybí HF_TOKEN nebo HF_REPO_ID v nastavení Renderu.")
+
+    clean_mod_name = "".join([c for c in mod_name.strip().lower() if c.isalnum() or c == "_"])
+    if not clean_mod_name:
+        return vaultupdate_view(username, password, view_owner, "❌ Neplatné ID modulu (použij jen písmena, čísla nebo podtržítko).")
+
+    code_path = f"system_ota/{clean_mod_name}.py"
+    try:
+        hf_api.upload_file(
+            path_or_fileobj=module_code.encode("utf-8"),
+            path_in_repo=code_path,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset"
+        )
+        code_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{code_path}"
+
+        existing_manifest = fetch_remote_manifest() or {"version": new_version.strip(), "notes": "", "modules": []}
+        modules_list = [m for m in existing_manifest.get("modules", []) if m.get("name") != clean_mod_name]
+        modules_list.append({
+            "name": clean_mod_name,
+            "title": mod_title.strip(),
+            "icon": mod_icon.strip() or "🧩",
+            "sub": mod_sub.strip() or "OTA Modul",
+            "version": new_version.strip(),
+            "code_url": code_url
+        })
+
+        updated_manifest = {
+            "version": new_version.strip(),
+            "notes": release_notes.strip(),
+            "modules": modules_list
+        }
+        hf_api.upload_file(
+            path_or_fileobj=json.dumps(updated_manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+            path_in_repo="system_ota/manifest.json",
+            repo_id=HF_REPO_ID,
+            repo_type="dataset"
+        )
+        return vaultupdate_view(username, password, view_owner, f"✅ Aktualizace v{new_version.strip()} ({mod_title.strip()}) byla publikována na Hugging Face! Nahoře ji teď můžeš nainstalovat.")
+    except Exception as e:
+        return vaultupdate_view(username, password, view_owner, f"❌ Chyba při nahrávání na Hugging Face: {e}")
 
 @app.post("/vaultupdate/publish-demo", response_class=HTMLResponse)
 def vaultupdate_publish_demo(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None)):
@@ -959,7 +1117,7 @@ def render(username, password, view_owner, supabase, action_data):
     <!DOCTYPE html><html lang="cs"><head><meta charset="UTF-8"><title>VaultNotes Pro (OTA Modul)</title>{VAULT_GRID_STYLE}</head>
     <body>
         <div class="glass-dashboard" style="max-width: 750px; border-color: rgba(250, 204, 21, 0.4);">
-            <div class="badge" style="color:#fde047; border-color:#fde047;">OTA Modul v17.1 • Načteno bez restartu</div>
+            <div class="badge" style="color:#fde047; border-color:#fde047;">OTA Modul • Načteno bez restartu</div>
             <h1 style="color:#fde047;">📝 VaultNotes Pro</h1>
             <p style="text-align:center;">Rychlý cloudový poznámkový blok nainstalovaný přes VaultUpdate</p>
             <form action="/ota-app/vaultnotes" method="POST" style="display:flex; gap:10px; margin-bottom:20px;">
@@ -984,22 +1142,24 @@ def render(username, password, view_owner, supabase, action_data):
     hf_api.upload_file(path_or_fileobj=ota_module_code.encode("utf-8"), path_in_repo=code_path, repo_id=HF_REPO_ID, repo_type="dataset")
     code_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{code_path}"
 
+    existing_manifest = fetch_remote_manifest() or {"version": "18.1", "notes": "", "modules": []}
+    modules_list = [m for m in existing_manifest.get("modules", []) if m.get("name") != "vaultnotes"]
+    modules_list.append({
+        "name": "vaultnotes",
+        "title": "VaultNotes Pro",
+        "icon": "📝",
+        "sub": "OTA Poznámky",
+        "version": "18.1",
+        "code_url": code_url
+    })
+
     manifest_obj = {
-        "version": "17.1",
+        "version": "18.1",
         "notes": "Přidána aplikace VaultNotes Pro (cloudový poznámkový blok) přímo do hlavního docku.",
-        "modules": [
-            {
-                "name": "vaultnotes",
-                "title": "VaultNotes Pro",
-                "icon": "📝",
-                "sub": "OTA Poznámky",
-                "version": "17.1",
-                "code_url": code_url
-            }
-        ]
+        "modules": modules_list
     }
     hf_api.upload_file(path_or_fileobj=json.dumps(manifest_obj, ensure_ascii=False, indent=2).encode("utf-8"), path_in_repo="system_ota/manifest.json", repo_id=HF_REPO_ID, repo_type="dataset")
-    return vaultupdate_view(username, password, view_owner, "✅ Balíček v17.1 byl nahrán na Hugging Face! Nyní klikni na 'Stáhnout a nainstalovat aktualizaci nyní'.")
+    return vaultupdate_view(username, password, view_owner, "✅ Balíček VaultNotes Pro byl nahrán na Hugging Face! Nyní klikni na 'Stáhnout a nainstalovat aktualizaci nyní'.")
 
 @app.post("/vaultupdate/install", response_class=HTMLResponse)
 def vaultupdate_install(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None)):
@@ -1012,13 +1172,14 @@ def vaultupdate_install(username: str = Form(...), password: str = Form(...), ta
         mod_name = mod.get("name")
         code_url = mod.get("code_url")
         if mod_name and code_url:
-            with urllib.request.urlopen(code_url) as resp:
+            req = urllib.request.Request(code_url, headers={"Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 code_str = resp.read().decode("utf-8")
             LOADED_OTA_MODULES[mod_name] = {
                 "title": mod.get("title", mod_name),
                 "icon": mod.get("icon", "🧩"),
                 "sub": mod.get("sub", "OTA Modul"),
-                "version": mod.get("version", manifest.get("version", "17.1")),
+                "version": str(mod.get("version", manifest.get("version", "18.1"))),
                 "code": code_str
             }
             if supabase:
@@ -1030,27 +1191,40 @@ def vaultupdate_install(username: str = Form(...), password: str = Form(...), ta
                     "folder": "/_ota", "size": len(code_str), "is_deleted": False
                 }).execute()
 
-    return vaultupdate_view(username, password, view_owner, f"🎉 Aktualizace na verzi v{manifest.get('version')} byla úspěšně nainstalována! Nová aplikace se objevila v horním docku.")
+    return vaultupdate_view(username, password, view_owner, f"🎉 Aktualizace na verzi v{manifest.get('version')} byla úspěšně nainstalována! Nové aplikace najdeš v horním docku.")
+
+@app.post("/vaultupdate/uninstall", response_class=HTMLResponse)
+def vaultupdate_uninstall(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), module_name: str = Form(...)):
+    view_owner = target_owner if target_owner else username
+    if module_name in LOADED_OTA_MODULES:
+        del LOADED_OTA_MODULES[module_name]
+    if supabase:
+        supabase.table("nxt_files").delete().eq("storage_provider", "vault_ota_module").eq("filename", module_name).execute()
+    return vaultupdate_view(username, password, view_owner, f"🗑️ OTA modul '{module_name}' byl odinstalován z jádra.")
 
 @app.get("/ota-app/{module_name}", response_class=HTMLResponse)
-def ota_app_get(module_name: str, username: str, password: str, target_owner: str = None):
+def ota_app_get(module_name: str, request: Request, username: str, password: str, target_owner: str = None):
     sync_ota_modules_from_db()
     view_owner = target_owner if target_owner else username
     if module_name not in LOADED_OTA_MODULES:
         return "OTA modul není nainstalován."
-    ns = {"VAULT_GRID_STYLE": VAULT_GRID_STYLE, "html": html}
+    ns = {"VAULT_GRID_STYLE": VAULT_GRID_STYLE, "html": html, "json": json}
     exec(LOADED_OTA_MODULES[module_name]["code"], ns)
-    return ns["render"](username, password, view_owner, supabase, {})
+    return ns["render"](username, password, view_owner, supabase, dict(request.query_params))
 
 @app.post("/ota-app/{module_name}", response_class=HTMLResponse)
-def ota_app_post(module_name: str, username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), note_text: str = Form("")):
+async def ota_app_post(module_name: str, request: Request):
     sync_ota_modules_from_db()
-    view_owner = target_owner if target_owner else username
+    form_data = dict(await request.form())
+    username = str(form_data.get("username", ""))
+    password = str(form_data.get("password", ""))
+    target_owner = form_data.get("target_owner")
+    view_owner = str(target_owner) if target_owner else username
     if module_name not in LOADED_OTA_MODULES:
         return "OTA modul není nainstalován."
-    ns = {"VAULT_GRID_STYLE": VAULT_GRID_STYLE, "html": html}
+    ns = {"VAULT_GRID_STYLE": VAULT_GRID_STYLE, "html": html, "json": json}
     exec(LOADED_OTA_MODULES[module_name]["code"], ns)
-    return ns["render"](username, password, view_owner, supabase, {"note_text": note_text})
+    return ns["render"](username, password, view_owner, supabase, form_data)
 
 # --- VAULTSHIELD PIN OPERACE ---
 @app.post("/set-folder-pin", response_class=HTMLResponse)
@@ -1313,9 +1487,9 @@ def app_center_view(username: str, password: str, target_owner: str = None):
 
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 15px; margin-top: 15px;">
                 <div class="box-section" style="margin-top:0;">
-                    <h3 style="margin-top:0; color: #34d399;">🔄 VaultUpdate OTA</h3>
-                    <p>Aktualizace funkcí systému z Hugging Face bez ručního upravování main.py.</p>
-                    <a href="/vaultupdate?username={username}&password={password}&target_owner={view_owner}" class="btn" style="background: #059669;">Otevřít VaultUpdate</a>
+                    <h3 style="margin-top:0; color: #34d399;">🔄 VaultUpdate & OTA Studio</h3>
+                    <p>Psaní, publikování a instalace nových aplikací přímo z prohlížeče bez úpravy main.py.</p>
+                    <a href="/vaultupdate?username={username}&password={password}&target_owner={view_owner}" class="btn" style="background: #059669;">Otevřít OTA Studio</a>
                 </div>
                 <div class="box-section" style="margin-top:0;">
                     <h3 style="margin-top:0; color: #f59e0b;">🟧 Plex / DLNA Media Server</h3>
@@ -1676,7 +1850,7 @@ def system_stats(username: str, password: str):
                 <p>💬 Zprávy ve VaultChatu: <b>{chat_count}</b></p>
                 <p>🧩 Aktivní OTA moduly: <b>{len(LOADED_OTA_MODULES)}</b></p>
                 <p>💾 Celková obsazená paměť: <b>{total_mb} MB</b></p>
-                <p>⚡ Jádro: <b>VaultGrid OS v{active_ver} + OTA Engine</b></p>
+                <p>⚡ Jádro: <b>VaultGrid OS v{active_ver} + OTA Studio</b></p>
             </div>
             <br><a href="javascript:history.back()" class="btn" style="background: #334155;">Zpět</a>
         </div>
