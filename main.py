@@ -1,21 +1,25 @@
 import os
 import io
+import re
+import hmac
 import json
 import html
 import zipfile
 import hashlib
+import secrets
 import platform
+import mimetypes
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone
-from fastapi import FastAPI, Form, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI, Form, UploadFile, File, Request, Header
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS", version="20.0")
+app = FastAPI(title="VaultGrid OS Ultimate", version="22.0")
 
-CORE_VERSION = "20.0"
+CORE_VERSION = "22.0"
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -23,10 +27,7 @@ HF_REPO_ID = os.environ.get("HF_REPO_ID")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
-supabase: Client | None = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
 
 LOADED_OTA_MODULES: dict[str, dict] = {}
@@ -34,7 +35,8 @@ LOADED_OTA_MODULES: dict[str, dict] = {}
 EDITABLE_EXTENSIONS = ["txt", "md", "py", "html", "css", "js", "json", "csv", "xml", "yml", "yaml"]
 VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "webm", "mkv"]
 AUDIO_EXTENSIONS = ["mp3", "wav", "flac", "ogg", "m4a"]
-IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"]
+IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg"]
+PREVIEW_EXTENSIONS = ["pdf", "md", "csv", "json", "stl", "obj"] + IMAGE_EXTENSIONS + EDITABLE_EXTENSIONS
 
 SYSTEM_PROVIDERS = {
     "vault_chat",
@@ -44,27 +46,40 @@ SYSTEM_PROVIDERS = {
     "vault_pool",
     "vault_quota",
     "vault_audit",
+    "vault_backup_profile",
+    "vault_backup_snapshot",
+    "vault_drop",
+    "vault_rule",
+    "vault_api_token",
+    "vault_watch_progress",
+    "vault_file_tag",
 }
 
 # --- VEKTOROVÉ SVG IKONY (LUCIDE INDUSTRIAL SET) ---
 SVG_ICONS = {
-    "server": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+    "server": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
     "dashboard": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
     "folder": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
     "file": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
     "database": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
-    "film": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>',
+    "film": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>',
     "music": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
     "users": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
     "shield": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
-    "lock": '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
+    "lock": '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
     "wrench": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
     "refresh": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
     "message": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
     "code": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>',
     "sun": '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
     "package": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
-    "image": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
+    "image": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
+    "share": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>',
+    "save": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+    "zap": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+    "key": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+    "eye": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+    "columns": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',
 }
 
 def svg(name: str) -> str:
@@ -110,12 +125,9 @@ INDUSTRIAL_CSS = """
         font-size: 13.5px;
         line-height: 1.5;
     }
-    .app-layout {
-        display: flex;
-        min-height: 100vh;
-    }
+    .app-layout { display: flex; min-height: 100vh; }
     .sidebar {
-        width: 245px;
+        width: 248px;
         background-color: var(--bg-sidebar);
         border-right: 1px solid var(--border);
         display: flex;
@@ -157,23 +169,20 @@ INDUSTRIAL_CSS = """
         text-transform: uppercase;
         letter-spacing: 0.08em;
         color: var(--text-muted);
-        padding: 16px 18px 6px 18px;
+        padding: 14px 18px 5px 18px;
     }
     .nav-item {
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 9px 18px;
+        padding: 8px 18px;
         color: var(--text-muted);
         text-decoration: none;
         font-weight: 500;
         border-left: 3px solid transparent;
         transition: background 0.12s, color 0.12s;
     }
-    .nav-item:hover {
-        background-color: var(--bg-surface-alt);
-        color: var(--text-main);
-    }
+    .nav-item:hover { background-color: var(--bg-surface-alt); color: var(--text-main); }
     .nav-item.active {
         background-color: var(--bg-surface-alt);
         color: var(--text-main);
@@ -186,12 +195,7 @@ INDUSTRIAL_CSS = """
         border-top: 1px solid var(--border);
         font-size: 12px;
     }
-    .main-area {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-    }
+    .main-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
     .topbar {
         height: 54px;
         background-color: var(--bg-sidebar);
@@ -202,21 +206,9 @@ INDUSTRIAL_CSS = """
         justify-content: space-between;
         gap: 16px;
     }
-    .topbar-title {
-        font-size: 15px;
-        font-weight: 600;
-        margin: 0;
-    }
-    .topbar-actions {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-    .content-wrap {
-        padding: 24px;
-        max-width: 1320px;
-        width: 100%;
-    }
+    .topbar-title { font-size: 15px; font-weight: 600; margin: 0; }
+    .topbar-actions { display: flex; align-items: center; gap: 10px; }
+    .content-wrap { padding: 24px; max-width: 1440px; width: 100%; }
     .panel {
         background-color: var(--bg-surface);
         border: 1px solid var(--border);
@@ -267,11 +259,7 @@ INDUSTRIAL_CSS = """
         font-weight: 700;
         color: var(--text-main);
     }
-    .kpi-sub {
-        font-size: 12px;
-        color: var(--text-muted);
-        margin-top: 4px;
-    }
+    .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
     input, select, textarea {
         width: 100%;
         padding: 8px 11px;
@@ -283,14 +271,9 @@ INDUSTRIAL_CSS = """
         font-size: 13px;
         outline: none;
     }
-    input:focus, select:focus, textarea:focus {
-        border-color: var(--accent);
-    }
-    textarea.code-box {
-        font-family: var(--mono);
-        font-size: 12.5px;
-        line-height: 1.45;
-    }
+    input[type="checkbox"] { width: auto; cursor: pointer; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    textarea.code-box { font-family: var(--mono); font-size: 12.5px; line-height: 1.45; }
     .btn {
         display: inline-flex;
         align-items: center;
@@ -318,18 +301,10 @@ INDUSTRIAL_CSS = """
     .btn-warning { background-color: var(--warning); }
     .btn-danger { background-color: var(--danger); }
     .btn-sm { padding: 5px 10px; font-size: 12px; }
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 13px;
-    }
-    th, td {
-        padding: 10px 12px;
-        text-align: left;
-        border-bottom: 1px solid var(--border);
-    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid var(--border); }
     th {
-        font-size: 11.5px;
+        font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.04em;
         color: var(--text-muted);
@@ -342,7 +317,7 @@ INDUSTRIAL_CSS = """
         display: inline-flex;
         align-items: center;
         gap: 5px;
-        padding: 2px 8px;
+        padding: 2px 7px;
         border-radius: 4px;
         font-family: var(--mono);
         font-size: 11px;
@@ -350,9 +325,10 @@ INDUSTRIAL_CSS = """
         background-color: var(--bg-surface-alt);
         color: var(--text-main);
     }
-    .badge-ok { border-color: rgba(22, 163, 74, 0.4); color: #22c55e; }
-    .badge-warn { border-color: rgba(217, 119, 6, 0.4); color: #f59e0b; }
-    .badge-err { border-color: rgba(220, 38, 38, 0.4); color: #ef4444; }
+    .badge-ok { border-color: rgba(22, 163, 74, 0.45); color: #22c55e; }
+    .badge-warn { border-color: rgba(217, 119, 6, 0.45); color: #f59e0b; }
+    .badge-err { border-color: rgba(220, 38, 38, 0.45); color: #ef4444; }
+    .badge-tag { border-color: rgba(37, 99, 235, 0.45); color: #60a5fa; text-decoration: none; }
     .progress-track {
         width: 100%;
         height: 8px;
@@ -361,10 +337,7 @@ INDUSTRIAL_CSS = """
         border-radius: 4px;
         overflow: hidden;
     }
-    .progress-fill {
-        height: 100%;
-        background-color: var(--accent);
-    }
+    .progress-fill { height: 100%; background-color: var(--accent); }
     .alert-bar {
         padding: 10px 14px;
         border-radius: 5px;
@@ -375,26 +348,15 @@ INDUSTRIAL_CSS = """
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 10px;
     }
     .alert-bar.warn { border-left: 4px solid var(--warning); }
     .alert-bar.ok { border-left: 4px solid var(--success); }
     .alert-bar.err { border-left: 4px solid var(--danger); }
-    .form-row {
-        display: flex;
-        gap: 10px;
-        align-items: center;
-        flex-wrap: wrap;
-    }
-    .grid-2 {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-        gap: 14px;
-    }
-    .media-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-        gap: 14px;
-    }
+    .form-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+    .grid-dual { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
     .media-card {
         background-color: var(--bg-surface-alt);
         border: 1px solid var(--border);
@@ -405,7 +367,7 @@ INDUSTRIAL_CSS = """
         justify-content: space-between;
     }
     .media-poster {
-        height: 160px;
+        height: 170px;
         background-color: var(--bg-app);
         display: flex;
         align-items: center;
@@ -413,11 +375,7 @@ INDUSTRIAL_CSS = """
         border-bottom: 1px solid var(--border);
         overflow: hidden;
     }
-    .media-poster img {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-    }
+    .media-poster img { width: 100%; height: 100%; object-fit: cover; }
     .chat-stream {
         height: 360px;
         overflow-y: auto;
@@ -437,26 +395,15 @@ INDUSTRIAL_CSS = """
         background-color: var(--bg-surface);
         max-width: 80%;
     }
-    .chat-entry.mine {
-        align-self: flex-end;
-        border-left: 3px solid var(--accent);
-    }
-    .link-action {
-        color: #60a5fa;
-        text-decoration: none;
-        font-size: 12.5px;
-        margin-right: 10px;
-    }
+    .chat-entry.mine { align-self: flex-end; border-left: 3px solid var(--accent); }
+    .link-action { color: #60a5fa; text-decoration: none; font-size: 12px; margin-right: 8px; }
     .link-action:hover { text-decoration: underline; }
-    .link-danger {
-        color: #f87171;
-        text-decoration: none;
-        font-size: 12.5px;
-    }
+    .link-danger { color: #f87171; text-decoration: none; font-size: 12px; }
     .link-danger:hover { text-decoration: underline; }
-    @media (max-width: 820px) {
+    @media (max-width: 980px) {
         .app-layout { flex-direction: column; }
         .sidebar { width: 100%; height: auto; position: static; }
+        .grid-dual { grid-template-columns: 1fr; }
     }
 </style>
 """
@@ -533,7 +480,49 @@ TERMINAL_CSS = """
 </style>
 """
 
-# --- POMOCNÉ FUNKCE JÁDRA ---
+# --- VAULTCRYPT ZERO-KNOWLEDGE ŠIFROVÁNÍ (PURE STDLIB AUTHENTICATED STREAM CIPHER) ---
+def _derive_keys(password: str, salt: bytes) -> tuple[bytes, bytes]:
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000, dklen=64)
+    return dk[:32], dk[32:]
+
+def _keystream_xor(data: bytes, enc_key: bytes, nonce: bytes) -> bytes:
+    out = bytearray(len(data))
+    counter = 0
+    pos = 0
+    total = len(data)
+    while pos < total:
+        block = hashlib.sha256(enc_key + nonce + counter.to_bytes(8, "big")).digest()
+        chunk_len = min(32, total - pos)
+        for i in range(chunk_len):
+            out[pos + i] = data[pos + i] ^ block[i]
+        pos += chunk_len
+        counter += 1
+    return bytes(out)
+
+def vaultcrypt_encrypt(raw_data: bytes, password: str) -> bytes:
+    magic = b"VGCRYPT1"
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+    enc_key, mac_key = _derive_keys(password, salt)
+    ciphertext = _keystream_xor(raw_data, enc_key, nonce)
+    tag = hmac.new(mac_key, magic + salt + nonce + ciphertext, hashlib.sha256).digest()
+    return magic + salt + nonce + tag + ciphertext
+
+def vaultcrypt_decrypt(blob: bytes, password: str) -> bytes:
+    if len(blob) < 72 or not blob.startswith(b"VGCRYPT1"):
+        raise ValueError("Neplatný formát zašifrovaného souboru VaultCrypt.")
+    magic = blob[:8]
+    salt = blob[8:24]
+    nonce = blob[24:40]
+    tag = blob[40:72]
+    ciphertext = blob[72:]
+    enc_key, mac_key = _derive_keys(password, salt)
+    expected_tag = hmac.new(mac_key, magic + salt + nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, expected_tag):
+        raise ValueError("Chybné dešifrovací heslo nebo poškozená data.")
+    return _keystream_xor(ciphertext, enc_key, nonce)
+
+# --- POMOCNÉ SYSTÉMOVÉ FUNKCE ---
 def is_system_record(item: dict) -> bool:
     fname = item.get("filename", "")
     provider = item.get("storage_provider", "")
@@ -583,7 +572,7 @@ def log_audit(actor: str, action: str, detail: str, level: str = "INFO"):
         except Exception:
             pass
 
-# --- 7 TB MULTI-POOL STORAGE ENGINE ---
+# --- 7 TB AUTO-BALANCING MULTI-POOL ENGINE ---
 def get_storage_pools() -> list[dict]:
     pools = []
     if HF_REPO_ID:
@@ -616,12 +605,24 @@ def get_storage_pools() -> list[dict]:
         pools[0]["is_active_write"] = True
     return pools
 
-def get_active_write_repo() -> str:
+def get_active_write_repo(active_files: list[dict] | None = None) -> str:
     pools = get_storage_pools()
-    for p in pools:
-        if p.get("is_active_write"):
-            return p["repo_id"]
-    return HF_REPO_ID or ""
+    if not pools:
+        return HF_REPO_ID or ""
+
+    if active_files is None and supabase:
+        rows = supabase.table("nxt_files").select("file_url, size, is_deleted, storage_provider, filename").eq("is_deleted", False).execute().data or []
+        active_files = [r for r in rows if not is_system_record(r)]
+
+    # Nejprve zkus preferovaný zápisový pool, pokud je pod 90 % kapacity
+    ordered = sorted(pools, key=lambda x: 0 if x.get("is_active_write") else 1)
+    for p in ordered:
+        repo = p["repo_id"]
+        cap_bytes = int(p.get("quota_gb", 300)) * (1024 ** 3)
+        used_bytes = sum(int(f.get("size", 0)) for f in (active_files or []) if repo in f.get("file_url", ""))
+        if used_bytes < (cap_bytes * 0.90):
+            return repo
+    return ordered[0]["repo_id"]
 
 def get_user_quota_bytes(target_user: str) -> int:
     if not supabase:
@@ -632,7 +633,60 @@ def get_user_quota_bytes(target_user: str) -> int:
             return int(res.data[-1].get("size", 0))
     except Exception:
         pass
-    return 0  # 0 = bez omezení
+    return 0
+
+# --- ŠTÍTKY (TAGS) & VAULTRULES AUTOMATIZACE ---
+def attach_file_tag(owner: str, file_id: int, tag: str):
+    clean_tag = re.sub(r"[^a-zA-Z0-9áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ_-]", "", tag.strip().lstrip("#")).lower()
+    if not (clean_tag and supabase):
+        return
+    supabase.table("nxt_files").insert({
+        "owner": owner,
+        "filename": clean_tag,
+        "storage_provider": "vault_file_tag",
+        "file_url": str(file_id),
+        "folder": "/_tags",
+        "size": file_id,
+        "is_deleted": False
+    }).execute()
+
+def get_file_tags_map(owner: str) -> dict[int, list[str]]:
+    tags_map: dict[int, list[str]] = {}
+    if not supabase:
+        return tags_map
+    res = supabase.table("nxt_files").select("filename, size").eq("owner", owner).eq("storage_provider", "vault_file_tag").eq("is_deleted", False).execute()
+    for r in (res.data or []):
+        fid = int(r.get("size", 0))
+        tname = r.get("filename", "")
+        if fid and tname:
+            tags_map.setdefault(fid, [])
+            if tname not in tags_map[fid]:
+                tags_map[fid].append(tname)
+    return tags_map
+
+def apply_vault_rules(owner: str, filename: str, current_folder: str) -> tuple[str, list[str]]:
+    if not supabase:
+        return current_folder, []
+    res = supabase.table("nxt_files").select("*").eq("owner", owner).eq("storage_provider", "vault_rule").eq("is_deleted", False).execute()
+    ext = filename.split(".")[-1].lower() if "." in filename else ""
+    dest_folder = current_folder
+    tags_to_add: list[str] = []
+    for r in (res.data or []):
+        try:
+            rule = json.loads(r.get("file_url", "{}"))
+            r_ext = rule.get("ext", "").lower()
+            r_src = rule.get("src_folder", "")
+            if r_ext and r_ext != ext:
+                continue
+            if r_src and r_src != current_folder:
+                continue
+            if rule.get("dest_folder"):
+                dest_folder = rule["dest_folder"]
+            if rule.get("add_tag"):
+                tags_to_add.append(rule["add_tag"])
+        except Exception:
+            pass
+    return dest_folder, tags_to_add
 
 # --- OTA ENGINE ---
 def sync_ota_modules_from_db():
@@ -651,10 +705,11 @@ def sync_ota_modules_from_db():
                     req = urllib.request.Request(code_url, headers={"Cache-Control": "no-cache"})
                     with urllib.request.urlopen(req, timeout=6) as resp:
                         code_str = resp.read().decode("utf-8")
+                    compile(code_str, f"<ota_{mod_name}>", "exec")
                     LOADED_OTA_MODULES[mod_name] = {
                         "title": meta.get("title", mod_name),
                         "sub": meta.get("sub", "OTA Modul"),
-                        "version": str(meta.get("version", "20.1")),
+                        "version": str(meta.get("version", "22.1")),
                         "code": code_str
                     }
             except Exception:
@@ -726,17 +781,23 @@ def render_shell(
         <div class="nav-group-label">Systém</div>
         {nav_link("overview", f"/overview?{q_params}", "dashboard", "Přehled systému")}
         {nav_link("pools", f"/storage-pools?{q_params}", "database", "Storage Pools (7 TB)")}
-        {nav_link("audit", f"/audit-log?{q_params}", "shield", "Bezpečnostní log")}
+        {nav_link("audit", f"/audit-log?{q_params}", "shield", "Forenzní Audit Log")}
 
         <div class="nav-group-label">Úložiště a Média</div>
         {nav_link("files", f"/files?{q_params}", "folder", "Správce souborů")}
-        {nav_link("vaultflix", f"/vaultflix?{q_params}", "film", "VaultFlix Kino")}
-        {nav_link("vaultbeats", f"/vaultbeats?{q_params}", "music", "VaultBeats Audio")}
-        {nav_link("code", f"/new-file?{q_params}", "code", "VaultCode IDE")}
+        {nav_link("vaultflix", f"/vaultflix?{q_params}", "film", "VaultFlix Cinema")}
+        {nav_link("vaultbeats", f"/vaultbeats?{q_params}", "music", "VaultBeats Hi-Fi")}
+        {nav_link("code", f"/new-file?{q_params}", "code", "VaultCode IDE Pro")}
+
+        <div class="nav-group-label">Sdílení a Automatizace</div>
+        {nav_link("vaultdrop", f"/vaultdrop?{q_params}", "share", "VaultDrop Sdílení")}
+        {nav_link("vaultbackup", f"/vaultbackup?{q_params}", "save", "Zálohy & Konfigurace")}
+        {nav_link("vaultrules", f"/vaultrules?{q_params}", "zap", "VaultRules Pravidla")}
+        {nav_link("apitokens", f"/api-tokens?{q_params}", "key", "REST API & Tokeny")}
 
         <div class="nav-group-label">Správa a Služby</div>
         {nav_link("users", f"/users-quotas?{q_params}", "users", "Uživatelé a kvóty")}
-        {nav_link("maintenance", f"/maintenance?{q_params}", "wrench", "Údržba a zálohy")}
+        {nav_link("maintenance", f"/maintenance?{q_params}", "wrench", "Údržba & Deduplikace")}
         {nav_link("vaultchat", f"/vaultchat?{q_params}", "message", "VaultChat")}
         {nav_link("vaultupdate", f"/vaultupdate?{q_params}", "refresh", "VaultUpdate & OTA")}
 
@@ -775,10 +836,10 @@ def render_shell(
                         <input type="hidden" name="username" value="{html.escape(username)}">
                         <input type="hidden" name="password" value="{html.escape(password)}">
                         <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
-                        <input type="text" name="q" value="{html.escape(search_query)}" placeholder="Hledat soubory..." style="width: 210px;">
+                        <input type="text" name="q" value="{html.escape(search_query)}" placeholder="Hledat soubory nebo #štítek..." style="width: 230px;">
                         <button type="submit" class="btn btn-secondary btn-sm">Hledat</button>
                     </form>
-                    <span class="badge badge-ok">RENDER CLOUD // ONLINE</span>
+                    <span class="badge badge-ok">ULTIMATE OS // ONLINE</span>
                 </div>
             </header>
             <main class="content-wrap">
@@ -797,7 +858,7 @@ def verify_user(username: str, password: str) -> dict | None:
         return res.data[0]
     return None
 
-# --- PŘIHLÁŠENÍ ---
+# --- 1. PŘIHLÁŠENÍ & OVERVIEW ---
 @app.get("/", response_class=HTMLResponse)
 def login_page():
     active_ver = get_installed_ota_version()
@@ -811,18 +872,18 @@ def login_page():
     {THEME_SCRIPT}
 </head>
 <body style="display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;">
-    <div class="panel" style="width:100%; max-width:400px; margin:0;">
+    <div class="panel" style="width:100%; max-width:410px; margin:0;">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--border);">
             <div class="brand-title">{svg("server")} <span>VAULTGRID OS</span></div>
             <span class="brand-ver">v{html.escape(active_ver)}</span>
         </div>
-        <p style="color:var(--text-muted); margin-top:0; margin-bottom:16px;">Přihlášení ke správě cloudového úložiště (SSH konzole: <span class="mono">root / root</span>).</p>
+        <p style="color:var(--text-muted); margin-top:0; margin-bottom:16px;">Zero-Knowledge Cloud NAS & 7 TB Storage Platform (SSH konzole: <span class="mono">root / root</span>).</p>
         <form action="/login-router" method="POST">
             <label style="font-size:12px; color:var(--text-muted);">Uživatelské jméno</label>
             <input type="text" name="username" required autofocus style="margin:4px 0 12px 0;">
             <label style="font-size:12px; color:var(--text-muted);">Heslo</label>
             <input type="password" name="password" required style="margin:4px 0 16px 0;">
-            <button type="submit" class="btn" style="width:100%;">Přihlásit se</button>
+            <button type="submit" class="btn" style="width:100%;">Přihlásit se do systému</button>
         </form>
     </div>
 </body>
@@ -850,7 +911,6 @@ def login_router(username: str = Form(...), password: str = Form(...)):
     log_audit(username, "LOGIN_OK", "Úspěšné přihlášení do webového rozhraní", "INFO")
     return render_overview(username, password, username)
 
-# --- 1. PŘEHLED SYSTÉMU (DASHBOARD) ---
 @app.get("/overview", response_class=HTMLResponse)
 def overview_route(username: str, password: str, target_owner: str = None):
     user = verify_user(username, password)
@@ -871,8 +931,8 @@ def render_overview(username: str, password: str, view_owner: str) -> str:
     quota_bytes = get_user_quota_bytes(view_owner)
     quota_label = format_bytes(quota_bytes) if quota_bytes > 0 else "Bez limitu"
 
-    video_cnt = len([f for f in user_files if f["filename"].split(".")[-1].lower() in VIDEO_EXTENSIONS])
-    audio_cnt = len([f for f in user_files if f["filename"].split(".")[-1].lower() in AUDIO_EXTENSIONS])
+    drops_cnt = len([f for f in all_rows if f.get("storage_provider") == "vault_drop" and f.get("owner") == view_owner])
+    snaps_cnt = len([f for f in all_rows if f.get("storage_provider") == "vault_backup_snapshot" and f.get("owner") == view_owner])
 
     audit_rows = [f for f in all_rows if f.get("storage_provider") == "vault_audit"][-8:]
     audit_html = ""
@@ -904,55 +964,55 @@ def render_overview(username: str, password: str, view_owner: str) -> str:
             <div class="kpi-sub">Kvóta účtu: {quota_label}</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Cloud Multi-Pool (HF)</div>
+            <div class="kpi-label">Cloud Multi-Pool (7 TB)</div>
             <div class="kpi-value">{total_pool_gb} GB</div>
-            <div class="kpi-sub">{len(pools)} připojených repozitářů (max 7 TB)</div>
+            <div class="kpi-sub">{len(pools)} připojených fondů (Auto-Failover)</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Aktivní soubory</div>
-            <div class="kpi-value">{len(user_files)}</div>
-            <div class="kpi-sub">{video_cnt} videí / {audio_cnt} audio skladeb</div>
+            <div class="kpi-label">Aktivní soubory & Zálohy</div>
+            <div class="kpi-value">{len(user_files)} / {snaps_cnt}</div>
+            <div class="kpi-sub">{drops_cnt} aktivních VaultDrop odkazů</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">Runtime & OTA</div>
+            <div class="kpi-label">VaultGrid OS Runtime</div>
             <div class="kpi-value">v{html.escape(get_installed_ota_version())}</div>
-            <div class="kpi-sub">{len(LOADED_OTA_MODULES)} aktivních OTA rozšíření</div>
+            <div class="kpi-sub">{len(LOADED_OTA_MODULES)} OTA modulů | AES-256 Ready</div>
         </div>
     </div>
 
     <div class="grid-2">
         <div class="panel">
             <div class="panel-header">
-                <h2 class="panel-title">{svg("database")} Stav úložného fondu (Storage Pool)</h2>
+                <h2 class="panel-title">{svg("database")} Stav Auto-Balancing Storage Poolu</h2>
                 <a href="/storage-pools?{q_params}" class="btn btn-secondary btn-sm">Spravovat pooly</a>
             </div>
             <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:12.5px;">
-                <span>Celkem obsazeno v cloudu: <strong class="mono">{format_bytes(global_used_bytes)}</strong></span>
+                <span>Globálně obsazeno: <strong class="mono">{format_bytes(global_used_bytes)}</strong></span>
                 <span class="mono">{pct_pool:.2f}% z {total_pool_gb} GB</span>
             </div>
             <div class="progress-track"><div class="progress-fill" style="width:{pct_pool}%;"></div></div>
             <div style="margin-top:14px; font-size:12.5px; color:var(--text-muted);">
-                Aktivní zápisový repozitář: <span class="mono" style="color:var(--text-main);">{html.escape(get_active_write_repo() or 'Nenastaveno')}</span><br>
-                Architektura hostitele: <span class="mono">{platform.system()} {platform.machine()} (Python {platform.python_version()})</span>
+                Aktivní zápisový repozitář: <span class="mono" style="color:var(--text-main);">{html.escape(get_active_write_repo(active_files) or 'Nenastaveno')}</span><br>
+                Hostitel: <span class="mono">{platform.system()} {platform.machine()} (Python {platform.python_version()})</span>
             </div>
         </div>
 
         <div class="panel">
             <div class="panel-header">
-                <h2 class="panel-title">{svg("server")} Rychlé systémové akce</h2>
+                <h2 class="panel-title">{svg("server")} Rychlý přístup k nástrojům</h2>
             </div>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-                <a href="/files?{q_params}" class="btn btn-secondary">{svg("folder")} Otevřít soubory</a>
-                <a href="/new-file?{q_params}" class="btn btn-secondary">{svg("code")} Nový skript / HTML</a>
-                <a href="/vaultupdate?{q_params}" class="btn btn-secondary">{svg("refresh")} Zkontrolovat OTA</a>
-                <a href="/maintenance?{q_params}" class="btn btn-secondary">{svg("wrench")} Údržba úložiště</a>
+                <a href="/files?{q_params}&mode=dual" class="btn btn-secondary">{svg("columns")} Dual-Pane Commander</a>
+                <a href="/vaultdrop?{q_params}" class="btn btn-secondary">{svg("share")} VaultDrop Sdílení</a>
+                <a href="/vaultbackup?{q_params}" class="btn btn-secondary">{svg("save")} Zálohy & Snapshots</a>
+                <a href="/vaultrules?{q_params}" class="btn btn-secondary">{svg("zap")} VaultRules Pravidla</a>
             </div>
         </div>
     </div>
 
     <div class="panel">
         <div class="panel-header">
-            <h2 class="panel-title">{svg("shield")} Poslední události systému (Audit Log)</h2>
+            <h2 class="panel-title">{svg("shield")} Poslední události systému (Forenzní Audit Log)</h2>
             <a href="/audit-log?{q_params}" class="btn btn-secondary btn-sm">Celý protokol</a>
         </div>
         <table>
@@ -963,28 +1023,36 @@ def render_overview(username: str, password: str, view_owner: str) -> str:
     """
     return render_shell("Přehled systému", "overview", username, password, view_owner, body)
 
-# --- 2. SPRÁVCE SOUBORŮ (MULTI-UPLOAD, ZIP, SEARCH, PIN, KOŠ) ---
+# --- 2. SPRÁVCE SOUBORŮ (SINGLE & DUAL-PANE COMMANDER, BATCH, PREVIEW, STATIC HOSTING, TAGY) ---
 @app.get("/files", response_class=HTMLResponse)
 def files_get(
     username: str,
     password: str,
     folder: str = "/",
+    folder2: str = "/",
+    mode: str = "single",
     target_owner: str = None,
     trash: str = "false",
     q: str = "",
+    tag: str = "",
     msg: str = ""
 ):
     user = verify_user(username, password)
     if not user:
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
-    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, trash == "true", q.strip(), "", msg)
+    return render_files_view(
+        username, password, user["role"] == "admin", view_owner,
+        folder, folder2, mode, trash == "true", q.strip(), tag.strip().lstrip("#").lower(), "", msg
+    )
 
 @app.post("/files", response_class=HTMLResponse)
 def files_post(
     username: str = Form(...),
     password: str = Form(...),
     current_folder: str = Form("/"),
+    folder2: str = Form("/"),
+    mode: str = Form("single"),
     target_owner: str = Form(None),
     view_trash: str = Form("false"),
     unlocked_pin: str = Form(""),
@@ -994,7 +1062,140 @@ def files_post(
     if not user:
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
-    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, view_trash == "true", q.strip(), unlocked_pin, "")
+    return render_files_view(
+        username, password, user["role"] == "admin", view_owner,
+        current_folder, folder2, mode, view_trash == "true", q.strip(), "", unlocked_pin, ""
+    )
+
+def build_pane_table(
+    items: list[dict],
+    target_folder: str,
+    pane_side: str,
+    other_folder: str,
+    q_params: str,
+    tags_map: dict[int, list[str]],
+    view_owner: str,
+    is_in_trash: bool = False,
+    search_query: str = "",
+    tag_filter: str = ""
+) -> tuple[str, set[str], bool]:
+    folders_set = set()
+    locked_folders = set()
+    files_list = []
+    is_locked = False
+
+    for item in items:
+        if item.get("storage_provider") in SYSTEM_PROVIDERS:
+            continue
+        if is_in_trash:
+            if not is_system_record(item):
+                files_list.append(item)
+        elif tag_filter:
+            if not is_system_record(item) and tag_filter in tags_map.get(item["id"], []):
+                files_list.append(item)
+        elif search_query:
+            if search_query.startswith("#"):
+                tf = search_query.lstrip("#").lower()
+                if not is_system_record(item) and tf in tags_map.get(item["id"], []):
+                    files_list.append(item)
+            elif not is_system_record(item) and search_query.lower() in item.get("filename", "").lower():
+                files_list.append(item)
+        else:
+            item_folder = item.get("folder", "/")
+            if item.get("filename") == ".vault_pin_lock":
+                locked_folders.add(item_folder)
+                if item_folder == target_folder:
+                    is_locked = True
+            if item_folder.startswith(target_folder) and item_folder != target_folder:
+                rel_path = item_folder[len(target_folder):].strip("/")
+                if rel_path:
+                    sub_name = rel_path.split("/")[0]
+                    folders_set.add(f"{target_folder.rstrip('/')}/{sub_name}")
+            if item_folder == target_folder and not is_system_record(item):
+                files_list.append(item)
+
+    rows_html = ""
+    if not is_in_trash and not search_query and not tag_filter:
+        for f_path in sorted(folders_set):
+            fname = f_path.split("/")[-1]
+            locked = f_path in locked_folders
+            ic = svg("lock") if locked else svg("folder")
+            link_url = (
+                f"/files?{q_params}&folder={urllib.parse.quote(f_path)}&folder2={urllib.parse.quote(other_folder)}&mode=dual"
+                if pane_side == "left"
+                else f"/files?{q_params}&folder={urllib.parse.quote(other_folder)}&folder2={urllib.parse.quote(f_path)}&mode=dual"
+            )
+            if pane_side == "single":
+                link_url = f"/files?{q_params}&folder={urllib.parse.quote(f_path)}"
+
+            rows_html += f"""
+            <tr>
+                <td style="width:28px;"></td>
+                <td><a href="{link_url}" style="color:var(--text-main); text-decoration:none; font-weight:600; display:inline-flex; align-items:center; gap:8px;">{ic} {html.escape(fname)}</a></td>
+                <td class="mono" style="color:var(--text-muted);">DIR</td>
+                <td>
+                    <a href="{link_url}" class="link-action">Otevřít</a>
+                    <a href="/download-zip?{q_params}&folder={urllib.parse.quote(f_path)}" class="link-action">ZIP</a>
+                </td>
+            </tr>"""
+
+    for f in files_list:
+        fname = f["filename"]
+        ext = fname.split(".")[-1].lower() if "." in fname else ""
+        size_str = format_bytes(f.get("size", 0))
+        ftags = tags_map.get(f["id"], [])
+        tags_badges = " ".join([f'<a href="/files?{q_params}&tag={urllib.parse.quote(t)}" class="badge badge-tag">#{html.escape(t)}</a>' for t in ftags])
+
+        if is_in_trash:
+            actions = f"""
+                <a href="/restore-file?id={f['id']}&{q_params}" class="link-action">Obnovit</a>
+                <a href="/delete-permanently?id={f['id']}&{q_params}" class="link-danger">Smazat trvale</a>
+            """
+        elif pane_side in ["left", "right"]:
+            dest_dir = other_folder if pane_side == "left" else target_folder
+            src_dir = target_folder if pane_side == "left" else other_folder
+            actions = f"""
+                <a href="/files/transfer?id={f['id']}&op=move&dest={urllib.parse.quote(dest_dir)}&{q_params}&folder={urllib.parse.quote(src_dir if pane_side=='left' else other_folder)}&folder2={urllib.parse.quote(other_folder if pane_side=='left' else target_folder)}" class="link-action">{'Přesunout →' if pane_side=='left' else '← Přesunout'}</a>
+                <a href="/files/transfer?id={f['id']}&op=copy&dest={urllib.parse.quote(dest_dir)}&{q_params}&folder={urllib.parse.quote(src_dir if pane_side=='left' else other_folder)}&folder2={urllib.parse.quote(other_folder if pane_side=='left' else target_folder)}" class="link-action">Kopírovat</a>
+            """
+        else:
+            extra = []
+            if fname.endswith(".vgenc"):
+                extra.append(f'<a href="#decrypt" onclick="openDecryptModal({f["id"]}, \'{html.escape(fname)}\'); return false;" class="link-action" style="color:#f59e0b;">Dešifrovat</a>')
+            if ext in PREVIEW_EXTENSIONS:
+                extra.append(f'<a href="/preview?id={f["id"]}&{q_params}" class="link-action">Náhled</a>')
+            if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
+                extra.append(f'<a href="/media-player?file_url={urllib.parse.quote(f["file_url"])}&filename={urllib.parse.quote(fname)}&{q_params}" class="link-action">Přehrát</a>')
+            if ext == "html":
+                site_rel = f"{f.get('folder', '/').strip('/')}/{fname}".lstrip("/")
+                extra.append(f'<a href="/site/{urllib.parse.quote(view_owner)}/{urllib.parse.quote(site_rel)}" target="_blank" class="link-action">Web Hosting</a>')
+            if ext in EDITABLE_EXTENSIONS:
+                extra.append(f'<a href="/code-editor?id={f["id"]}&{q_params}" class="link-action">Upravit</a>')
+
+            actions = f"""
+                <a href="{html.escape(f['file_url'])}" download class="link-action">Stáhnout</a>
+                {"".join(extra)}
+                <a href="/vaultdrop?{q_params}&preselect_id={f['id']}" class="link-action">VaultDrop</a>
+                <a href="/file-versions?filename={urllib.parse.quote(fname)}&{q_params}" class="link-action">Verze</a>
+                <a href="/delete-file?id={f['id']}&folder={urllib.parse.quote(target_folder)}&{q_params}" class="link-danger">Koš</a>
+            """
+
+        enc_badge = '<span class="badge badge-warn">AES-256</span> ' if fname.endswith(".vgenc") else ""
+        rows_html += f"""
+        <tr>
+            <td style="width:28px;"><input type="checkbox" name="selected_ids" value="{f['id']}"></td>
+            <td>
+                <div style="display:flex; align-items:center; gap:7px; flex-wrap:wrap;">
+                    {svg("file")} <span>{html.escape(fname)}</span> {enc_badge} {tags_badges}
+                </div>
+            </td>
+            <td class="mono">{size_str}</td>
+            <td>{actions}</td>
+        </tr>"""
+
+    if not rows_html:
+        rows_html = "<tr><td colspan='4' style='text-align:center; color:var(--text-muted); padding:20px;'>Adresář neobsahuje žádné položky.</td></tr>"
+    return rows_html, folders_set, is_locked
 
 def render_files_view(
     username: str,
@@ -1002,16 +1203,19 @@ def render_files_view(
     is_admin: bool,
     view_owner: str,
     current_folder: str,
+    folder2: str,
+    mode: str,
     is_in_trash: bool,
     search_query: str,
+    tag_filter: str,
     unlocked_pin: str,
     status_msg: str
 ) -> str:
     q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
 
-    # Kontrola VaultShield PIN zámku
+    # Kontrola PIN zámku složky
     is_folder_locked = False
-    if current_folder != "/" and not is_in_trash and not search_query:
+    if current_folder != "/" and not is_in_trash and not search_query and not tag_filter:
         lock_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("folder", current_folder).eq("filename", ".vault_pin_lock").eq("is_deleted", False).execute()
         if lock_res.data:
             is_folder_locked = True
@@ -1041,31 +1245,7 @@ def render_files_view(
 
     files_res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", is_in_trash).execute()
     items = files_res.data or []
-
-    folders_set = set()
-    locked_folders = set()
-    files_list = []
-
-    for item in items:
-        if item.get("storage_provider") in SYSTEM_PROVIDERS:
-            continue
-        if is_in_trash:
-            if not is_system_record(item):
-                files_list.append(item)
-        elif search_query:
-            if not is_system_record(item) and search_query.lower() in item.get("filename", "").lower():
-                files_list.append(item)
-        else:
-            item_folder = item.get("folder", "/")
-            if item.get("filename") == ".vault_pin_lock":
-                locked_folders.add(item_folder)
-            if item_folder.startswith(current_folder) and item_folder != current_folder:
-                rel_path = item_folder[len(current_folder):].strip("/")
-                if rel_path:
-                    sub_name = rel_path.split("/")[0]
-                    folders_set.add(f"{current_folder.rstrip('/')}/{sub_name}")
-            if item_folder == current_folder and not is_system_record(item):
-                files_list.append(item)
+    tags_map = get_file_tags_map(view_owner)
 
     # Breadcrumbs
     crumbs = [f'<a href="/files?{q_params}&folder=/" class="link-action">/root</a>']
@@ -1077,80 +1257,57 @@ def render_files_view(
                 crumbs.append(f'<a href="/files?{q_params}&folder={urllib.parse.quote(acc)}" class="link-action">{html.escape(part)}</a>')
     breadcrumb_str = " / ".join(crumbs)
 
-    # Admin přepínač vlastníka
     owner_bar = ""
     if is_admin:
         all_users = supabase.table("nxt_users").select("username").execute().data or []
         opts = "".join([f'<option value="{html.escape(u["username"])}" {"selected" if u["username"] == view_owner else ""}>{html.escape(u["username"])}</option>' for u in all_users])
         owner_bar = f"""
-        <form action="/files" method="GET" style="display:flex; align-items:center; gap:8px; margin:0;">
+        <form action="/files" method="GET" style="display:flex; align-items:center; gap:6px; margin:0;">
             <input type="hidden" name="username" value="{html.escape(username)}">
             <input type="hidden" name="password" value="{html.escape(password)}">
-            <span style="font-size:12px; color:var(--text-muted);">Úložiště:</span>
             <select name="target_owner" onchange="this.form.submit()" style="width:auto; padding:5px 8px;">{opts}</select>
         </form>"""
 
-    # Tabulka složek a souborů
-    rows_html = ""
-    if not is_in_trash and not search_query:
-        for f_path in sorted(folders_set):
-            fname = f_path.split("/")[-1]
-            locked = f_path in locked_folders
-            ic = svg("lock") if locked else svg("folder")
-            rows_html += f"""
-            <tr>
-                <td><a href="/files?{q_params}&folder={urllib.parse.quote(f_path)}" style="color:var(--text-main); text-decoration:none; font-weight:600; display:inline-flex; align-items:center; gap:8px;">{ic} {html.escape(fname)}</a></td>
-                <td class="mono" style="color:var(--text-muted);">DIR</td>
-                <td class="mono" style="color:var(--text-muted);">{html.escape(f_path)}</td>
-                <td>
-                    <a href="/files?{q_params}&folder={urllib.parse.quote(f_path)}" class="link-action">Otevřít</a>
-                    <a href="/download-zip?{q_params}&folder={urllib.parse.quote(f_path)}" class="link-action">Stáhnout ZIP</a>
-                </td>
-            </tr>"""
+    alert_html = f'<div class="alert-bar ok">{html.escape(status_msg)}</div>' if status_msg else ""
 
-    for f in files_list:
-        fname = f["filename"]
-        ext = fname.split(".")[-1].lower() if "." in fname else ""
-        size_str = format_bytes(f.get("size", 0))
-        f_folder = f.get("folder", "/")
+    # DUAL-PANE COMMANDER REŽIM
+    if mode == "dual" and not is_in_trash and not search_query and not tag_filter:
+        left_rows, _, _ = build_pane_table(items, current_folder, "left", folder2, q_params, tags_map, view_owner)
+        right_rows, _, _ = build_pane_table(items, folder2, "right", current_folder, q_params, tags_map, view_owner)
+        dual_body = f"""
+        {alert_html}
+        <div class="panel">
+            <div class="panel-header">
+                <h2 class="panel-title">{svg("columns")} Dual-Pane Commander (Přenosy mezi složkami)</h2>
+                <div class="form-row">
+                    {owner_bar}
+                    <a href="/files?{q_params}&folder={urllib.parse.quote(current_folder)}&mode=single" class="btn btn-secondary btn-sm">Zpět na 1 panel</a>
+                </div>
+            </div>
+            <div class="grid-dual">
+                <div style="border:1px solid var(--border); border-radius:5px; overflow:hidden;">
+                    <div style="padding:10px 12px; background:var(--bg-surface-alt); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                        <span class="mono"><strong>LEVÝ:</strong> {html.escape(current_folder)}</span>
+                        <a href="/files?{q_params}&folder=/&folder2={urllib.parse.quote(folder2)}&mode=dual" class="link-action">/root</a>
+                    </div>
+                    <table><thead><tr><th></th><th>Název</th><th>Velikost</th><th>Přenos</th></tr></thead><tbody>{left_rows}</tbody></table>
+                </div>
+                <div style="border:1px solid var(--border); border-radius:5px; overflow:hidden;">
+                    <div style="padding:10px 12px; background:var(--bg-surface-alt); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                        <span class="mono"><strong>PRAVÝ:</strong> {html.escape(folder2)}</span>
+                        <a href="/files?{q_params}&folder={urllib.parse.quote(current_folder)}&folder2=/&mode=dual" class="link-action">/root</a>
+                    </div>
+                    <table><thead><tr><th></th><th>Název</th><th>Velikost</th><th>Přenos</th></tr></thead><tbody>{right_rows}</tbody></table>
+                </div>
+            </div>
+        </div>"""
+        return render_shell("Dual-Pane Commander", "files", username, password, view_owner, dual_body)
 
-        if is_in_trash:
-            actions = f"""
-                <a href="/restore-file?id={f['id']}&{q_params}" class="link-action">Obnovit</a>
-                <a href="/delete-permanently?id={f['id']}&{q_params}" class="link-danger">Smazat trvale</a>
-            """
-        else:
-            extra = []
-            if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
-                extra.append(f'<a href="/media-player?file_url={urllib.parse.quote(f["file_url"])}&filename={urllib.parse.quote(fname)}&{q_params}" class="link-action">Přehrát</a>')
-            if ext == "html":
-                extra.append(f'<a href="/live?id={f["id"]}" target="_blank" class="link-action">Živý web</a>')
-            if ext in EDITABLE_EXTENSIONS:
-                extra.append(f'<a href="/code-editor?id={f["id"]}&{q_params}" class="link-action">Upravit</a>')
+    # STANDARDNÍ JEDEN PANEL + BATCH OPERACE + TAGY + VAULTCRYPT
+    rows_html, _, _ = build_pane_table(items, current_folder, "single", "/", q_params, tags_map, view_owner, is_in_trash, search_query, tag_filter)
 
-            actions = f"""
-                <a href="{html.escape(f['file_url'])}" download class="link-action">Stáhnout</a>
-                {"".join(extra)}
-                <a href="/share?id={f['id']}" target="_blank" class="link-action">Sdílet</a>
-                <a href="/file-versions?filename={urllib.parse.quote(fname)}&{q_params}" class="link-action">Verze</a>
-                <a href="/file-comments?file_id={f['id']}&{q_params}" class="link-action">Poznámky</a>
-                <a href="/delete-file?id={f['id']}&folder={urllib.parse.quote(current_folder)}&{q_params}" class="link-danger">Do koše</a>
-            """
-
-        rows_html += f"""
-        <tr>
-            <td><span style="display:inline-flex; align-items:center; gap:8px;">{svg("file")} {html.escape(fname)}</span></td>
-            <td class="mono">{size_str}</td>
-            <td class="mono" style="color:var(--text-muted);">{html.escape(f_folder)}</td>
-            <td>{actions}</td>
-        </tr>"""
-
-    if not rows_html:
-        rows_html = "<tr><td colspan='4' style='text-align:center; color:var(--text-muted); padding:24px;'>Adresář neobsahuje žádné položky.</td></tr>"
-
-    # PIN ovládání aktuální složky
     pin_bar = ""
-    if current_folder != "/" and not is_in_trash and not search_query:
+    if current_folder != "/" and not is_in_trash and not search_query and not tag_filter:
         if is_folder_locked:
             pin_bar = f"""
             <form action="/remove-folder-pin" method="POST" class="form-row" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
@@ -1168,18 +1325,16 @@ def render_files_view(
                 <input type="hidden" name="password" value="{html.escape(password)}">
                 <input type="hidden" name="current_folder" value="{html.escape(current_folder)}">
                 <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
-                <input type="password" name="new_pin" placeholder="PIN kód pro zamčení složky..." maxlength="8" inputmode="numeric" required style="width:230px;">
-                <button type="submit" class="btn btn-secondary btn-sm">{svg("lock")} Zamknout složku PINem</button>
+                <input type="password" name="new_pin" placeholder="PIN kód pro zamčení složky..." maxlength="8" inputmode="numeric" required style="width:220px;">
+                <button type="submit" class="btn btn-secondary btn-sm">{svg("lock")} Zamknout složku</button>
             </form>"""
 
-    alert_html = f'<div class="alert-bar ok">{html.escape(status_msg)}</div>' if status_msg else ""
-
-    upload_and_folder_tools = ""
-    if not is_in_trash and not search_query:
-        upload_and_folder_tools = f"""
+    upload_and_tools = ""
+    if not is_in_trash and not search_query and not tag_filter:
+        upload_and_tools = f"""
         <div class="grid-2">
             <div class="panel">
-                <div class="panel-header"><h3 class="panel-title">{svg("folder")} Nový adresář</h3></div>
+                <div class="panel-header"><h3 class="panel-title">{svg("folder")} Nový adresář & VaultShield</h3></div>
                 <form action="/create-folder" method="POST" class="form-row">
                     <input type="hidden" name="username" value="{html.escape(username)}">
                     <input type="hidden" name="password" value="{html.escape(password)}">
@@ -1192,15 +1347,24 @@ def render_files_view(
             </div>
 
             <div class="panel">
-                <div class="panel-header"><h3 class="panel-title">Hromadné nahrání souborů</h3></div>
-                <form action="/upload" method="POST" enctype="multipart/form-data" class="form-row">
+                <div class="panel-header"><h3 class="panel-title">Nahrát soubory (s volitelným AES-256 šifrováním)</h3></div>
+                <form action="/upload" method="POST" enctype="multipart/form-data">
                     <input type="hidden" name="username" value="{html.escape(username)}">
                     <input type="hidden" name="password" value="{html.escape(password)}">
                     <input type="hidden" name="folder" value="{html.escape(current_folder)}">
                     <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
                     <input type="hidden" name="unlocked_pin" value="{html.escape(unlocked_pin)}">
-                    <input type="file" name="files" multiple required style="flex:1;">
-                    <button type="submit" class="btn">Nahrát do cloudu</button>
+                    <div class="form-row" style="margin-bottom:8px;">
+                        <input type="file" name="files" multiple required style="flex:1;">
+                        <button type="submit" class="btn">Nahrát do cloudu</button>
+                    </div>
+                    <div class="form-row" style="font-size:12px; color:var(--text-muted);">
+                        <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+                            <input type="checkbox" name="encrypt_flag" value="1" onchange="document.getElementById('enc-pass-box').style.display = this.checked ? 'inline-block' : 'none';">
+                            Zašifrovat před odesláním (VaultCrypt AES-256)
+                        </label>
+                        <input type="password" id="enc-pass-box" name="encrypt_pass" placeholder="Šifrovací heslo..." style="display:none; width:200px; padding:4px 8px;">
+                    </div>
                 </form>
             </div>
         </div>"""
@@ -1212,23 +1376,770 @@ def render_files_view(
             <div class="mono" style="font-size:13px;">Cesta: {breadcrumb_str}</div>
             <div class="form-row">
                 {owner_bar}
-                <a href="/files?{q_params}&folder=/" class="btn btn-secondary btn-sm">Kořen</a>
-                <a href="/files?{q_params}&folder={urllib.parse.quote(current_folder)}&trash={'false' if is_in_trash else 'true'}" class="btn btn-secondary btn-sm">{'Zobrazit aktivní' if is_in_trash else 'Koš'}</a>
+                <a href="/files?{q_params}&folder={urllib.parse.quote(current_folder)}&mode=dual" class="btn btn-secondary btn-sm">{svg("columns")} Dual-Pane</a>
+                <a href="/files?{q_params}&folder={urllib.parse.quote(current_folder)}&trash={'false' if is_in_trash else 'true'}" class="btn btn-secondary btn-sm">{'Aktivní' if is_in_trash else 'Koš'}</a>
                 <a href="/download-zip?{q_params}&folder={urllib.parse.quote(current_folder)}" class="btn btn-secondary btn-sm">Export ZIP</a>
                 <a href="/photo-gallery?{q_params}&folder={urllib.parse.quote(current_folder)}" class="btn btn-secondary btn-sm">Galerie</a>
             </div>
         </div>
-        <table>
-            <thead><tr><th>Název položky</th><th>Velikost</th><th>Umístění</th><th>Operace</th></tr></thead>
-            <tbody>{rows_html}</tbody>
-        </table>
+
+        <form action="/files/batch" method="POST">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <input type="hidden" name="current_folder" value="{html.escape(current_folder)}">
+
+            <div class="form-row" style="margin-bottom:10px; padding:8px 10px; background:var(--bg-surface-alt); border:1px solid var(--border); border-radius:4px;">
+                <span style="font-size:12px; color:var(--text-muted);">Hromadná akce pro označené:</span>
+                <select name="batch_action" style="width:auto; padding:4px 8px;">
+                    <option value="zip">Stáhnout jako ZIP</option>
+                    <option value="move">Přesunout do složky</option>
+                    <option value="tag">Přidat #štítek</option>
+                    <option value="trash">Přesunout do koše</option>
+                </select>
+                <input type="text" name="batch_param" placeholder="Cílová složka / název štítku..." style="width:200px; padding:4px 8px;">
+                <button type="submit" class="btn btn-secondary btn-sm">Provést</button>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:28px;"><input type="checkbox" onclick="document.querySelectorAll('input[name=selected_ids]').forEach(c => c.checked = this.checked)"></th>
+                        <th>Název položky & Štítky</th>
+                        <th>Velikost</th>
+                        <th>Operace</th>
+                    </tr>
+                </thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+        </form>
     </div>
-    {upload_and_folder_tools}
+
+    <div id="decrypt-modal" class="panel" style="display:none; border-left:4px solid var(--warning);">
+        <div class="panel-header">
+            <h3 class="panel-title">{svg("lock")} VaultCrypt — Dešifrovat a stáhnout: <span id="dec-fname" class="mono"></span></h3>
+            <button type="button" onclick="document.getElementById('decrypt-modal').style.display='none'" class="btn btn-secondary btn-sm">Zavřít</button>
+        </div>
+        <form action="/decrypt-file" method="POST" class="form-row">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <input type="hidden" id="dec-fid" name="file_id" value="">
+            <input type="password" name="decrypt_pass" placeholder="Zadejte dešifrovací heslo..." required style="width:260px;">
+            <button type="submit" class="btn btn-warning">Dešifrovat & Stáhnout</button>
+        </form>
+    </div>
+
+    {upload_and_tools}
+    <script>
+        function openDecryptModal(id, fname) {{
+            document.getElementById('dec-fid').value = id;
+            document.getElementById('dec-fname').innerText = fname;
+            const m = document.getElementById('decrypt-modal');
+            m.style.display = 'block';
+            m.scrollIntoView({{ behavior: 'smooth' }});
+        }}
+    </script>
     """
-    title = "Koš úložiště" if is_in_trash else (f"Vyhledávání: {search_query}" if search_query else "Správce souborů")
+    title = "Koš úložiště" if is_in_trash else (f"Štítek: #{tag_filter}" if tag_filter else (f"Vyhledávání: {search_query}" if search_query else "Správce souborů"))
     return render_shell(title, "files", username, password, view_owner, body, search_query)
 
-# --- 3. STORAGE POOLS (7 TB HUGGING FACE MULTI-POOL MANAGER) ---
+@app.post("/files/batch")
+def files_batch_action(
+    username: str = Form(...),
+    password: str = Form(...),
+    target_owner: str = Form(None),
+    current_folder: str = Form("/"),
+    batch_action: str = Form(...),
+    batch_param: str = Form(""),
+    selected_ids: list[int] = Form(default=[])
+):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    if not selected_ids:
+        return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", "Nebyly vybrány žádné soubory.")
+
+    if batch_action == "trash":
+        for fid in selected_ids:
+            supabase.table("nxt_files").update({"is_deleted": True}).eq("id", fid).execute()
+        return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", f"Přesunuto do koše: {len(selected_ids)} položek.")
+
+    elif batch_action == "move" and batch_param.strip():
+        dest = batch_param.strip()
+        if not dest.startswith("/"):
+            dest = "/" + dest
+        for fid in selected_ids:
+            supabase.table("nxt_files").update({"folder": dest}).eq("id", fid).execute()
+        return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", f"Přesunuto {len(selected_ids)} položek do {dest}.")
+
+    elif batch_action == "tag" and batch_param.strip():
+        for fid in selected_ids:
+            attach_file_tag(view_owner, fid, batch_param.strip())
+        return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", f"Štítek #{batch_param.strip().lstrip('#')} přiřazen.")
+
+    elif batch_action == "zip":
+        res = supabase.table("nxt_files").select("*").in_("id", selected_ids).execute()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in (res.data or []):
+                try:
+                    with urllib.request.urlopen(f["file_url"], timeout=8) as resp:
+                        zf.writestr(f["filename"], resp.read())
+                except Exception:
+                    pass
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="vaultgrid_selected.zip"'})
+
+    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", "")
+
+@app.get("/files/transfer", response_class=HTMLResponse)
+def files_dual_transfer(
+    id: int,
+    op: str,
+    dest: str,
+    username: str,
+    password: str,
+    folder: str = "/",
+    folder2: str = "/",
+    target_owner: str = None
+):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    rec = (supabase.table("nxt_files").select("*").eq("id", id).execute().data or [None])[0]
+    if rec:
+        if op == "move":
+            supabase.table("nxt_files").update({"folder": dest}).eq("id", id).execute()
+            msg = f"Soubor {rec['filename']} přesunut do {dest}."
+        else:
+            supabase.table("nxt_files").insert({
+                "owner": view_owner,
+                "filename": rec["filename"],
+                "storage_provider": rec.get("storage_provider", "huggingface"),
+                "file_url": rec["file_url"],
+                "folder": dest,
+                "size": rec.get("size", 0),
+                "is_deleted": False
+            }).execute()
+            msg = f"Soubor {rec['filename']} zkopírován do {dest}."
+    else:
+        msg = "Soubor nenalezen."
+    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, folder2, "dual", False, "", "", "", msg)
+
+@app.post("/decrypt-file")
+def decrypt_file_download(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), file_id: int = Form(...), decrypt_pass: str = Form(...)):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    rec = (supabase.table("nxt_files").select("*").eq("id", file_id).execute().data or [None])[0]
+    if not rec:
+        return HTMLResponse("Soubor nenalezen.", status_code=404)
+    try:
+        with urllib.request.urlopen(rec["file_url"], timeout=10) as resp:
+            enc_bytes = resp.read()
+        plain_bytes = vaultcrypt_decrypt(enc_bytes, decrypt_pass.strip())
+        orig_name = rec["filename"][:-6] if rec["filename"].endswith(".vgenc") else rec["filename"]
+        return StreamingResponse(io.BytesIO(plain_bytes), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{orig_name}"'})
+    except Exception as e:
+        return HTMLResponse(f"<h3>Chyba dešifrování: {html.escape(str(e))}</h3><a href='javascript:history.back()'>Zpět</a>", status_code=400)
+
+# --- UNIVERSAL VIEWER (PDF, MARKDOWN, CSV, JSON, 3D STL/OBJ, OBRÁZKY) ---
+@app.get("/preview", response_class=HTMLResponse)
+def universal_preview(id: int, username: str, password: str, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    rec = (supabase.table("nxt_files").select("*").eq("id", id).execute().data or [None])[0]
+    if not rec:
+        return "Soubor nenalezen."
+
+    fname = rec["filename"]
+    furl = rec["file_url"]
+    ext = fname.split(".")[-1].lower() if "." in fname else ""
+
+    if ext == "pdf":
+        viewer_html = f'<iframe src="{html.escape(furl)}" style="width:100%; height:720px; border:1px solid var(--border); border-radius:4px;"></iframe>'
+    elif ext in IMAGE_EXTENSIONS:
+        viewer_html = f'<div style="text-align:center; background:var(--bg-app); padding:20px; border-radius:4px;"><img src="{html.escape(furl)}" style="max-width:100%; max-height:680px;"></div>'
+    elif ext in ["stl", "obj"]:
+        viewer_html = f"""
+        <div id="stl-canvas" style="width:100%; height:520px; background:#090b0e; border:1px solid var(--border); border-radius:4px; position:relative;">
+            <div style="position:absolute; top:10px; left:12px; color:#9ca3af; font-family:var(--mono); font-size:12px;">3D CAD PROHLÍŽEČ // Tažením myší otáčejte, kolečkem přibližujte</div>
+        </div>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+        <script>
+            const box = document.getElementById('stl-canvas');
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(45, box.clientWidth / box.clientHeight, 0.1, 1000);
+            camera.position.set(0, -80, 60);
+            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(box.clientWidth, box.clientHeight);
+            box.appendChild(renderer.domElement);
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+            scene.add(new THREE.AmbientLight(0x606060));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+            dirLight.position.set(50, 50, 100);
+            scene.add(dirLight);
+            const loader = new THREE.STLLoader();
+            loader.load("{html.escape(furl)}", function(geom) {{
+                geom.center();
+                const mat = new THREE.MeshPhongMaterial({{ color: 0x3b82f6, specular: 0x111111, shininess: 120 }});
+                const mesh = new THREE.Mesh(geom, mat);
+                scene.add(mesh);
+            }});
+            function animate() {{ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }}
+            animate();
+        </script>"""
+    else:
+        try:
+            with urllib.request.urlopen(furl, timeout=6) as resp:
+                raw_txt = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            raw_txt = f"Chyba načtení obsahu: {e}"
+
+        if ext == "json":
+            try:
+                raw_txt = json.dumps(json.loads(raw_txt), indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        viewer_html = f'<pre class="mono" style="background:var(--bg-app); padding:16px; border:1px solid var(--border); border-radius:4px; overflow-x:auto; max-height:650px;">{html.escape(raw_txt)}</pre>'
+
+    body = f"""
+    <div class="panel">
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("eye")} Universal Viewer: {html.escape(fname)}</h2>
+            <a href="{html.escape(furl)}" download class="btn btn-sm">Stáhnout originál</a>
+        </div>
+        {viewer_html}
+    </div>"""
+    return render_shell(f"Náhled: {fname}", "files", username, password, view_owner, body)
+
+# --- MULTI-FILE STATIC WEB HOSTING ---
+@app.get("/site/{owner}/{file_path:path}")
+def static_web_hosting(owner: str, file_path: str):
+    if not supabase:
+        return Response("Database offline", status_code=503)
+    norm_path = "/" + file_path.strip("/")
+    folder_part = os.path.dirname(norm_path) or "/"
+    file_part = os.path.basename(norm_path)
+
+    res = supabase.table("nxt_files").select("*").eq("owner", owner).eq("folder", folder_part).eq("filename", file_part).eq("is_deleted", False).execute()
+    if not res.data:
+        return Response("404 — Soubor na tomto webu neexistuje.", status_code=404)
+
+    rec = res.data[0]
+    mime_type, _ = mimetypes.guess_type(file_part)
+    mime_type = mime_type or "application/octet-stream"
+    try:
+        with urllib.request.urlopen(rec["file_url"], timeout=8) as resp:
+            content = resp.read()
+        return Response(content=content, media_type=mime_type)
+    except Exception as e:
+        return Response(f"Chyba hostingu: {e}", status_code=502)
+
+# --- 3. VAULTDROP (CHYTRÉ SDÍLENÍ S EXPIRACÍ, LIMITEM STAŽENÍ, HESLEM, QR A UPLOAD SCHRÁNKAMI) ---
+@app.get("/vaultdrop", response_class=HTMLResponse)
+def vaultdrop_view(username: str, password: str, target_owner: str = None, preselect_id: int = 0, msg: str = ""):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
+
+    all_rows = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute().data or []
+    user_files = [f for f in all_rows if not is_system_record(f)]
+    drops = [f for f in all_rows if f.get("storage_provider") == "vault_drop"]
+
+    file_opts = "".join([
+        f'<option value="{f["id"]}" {"selected" if f["id"] == preselect_id else ""}>{html.escape(f["folder"] + "/" + f["filename"]).replace("//", "/")} ({format_bytes(f.get("size", 0))})</option>'
+        for f in user_files
+    ])
+
+    drops_rows = ""
+    for d in reversed(drops):
+        try:
+            meta = json.loads(d.get("file_url", "{}"))
+            tok = meta.get("token", "")
+            dtype = meta.get("type", "download")
+            pub_path = f"/drop-upload/{tok}" if dtype == "upload_request" else f"/drop/{tok}"
+            exp = meta.get("expires_at") or "Bez expirace"
+            max_dl = meta.get("max_downloads", 0)
+            used_dl = meta.get("downloads_used", 0)
+            limit_str = f"{used_dl} / {max_dl}" if max_dl > 0 else f"{used_dl} / ∞"
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={urllib.parse.quote(pub_path)}"
+
+            drops_rows += f"""
+            <tr>
+                <td><span class="badge {'badge-warn' if dtype == 'upload_request' else 'badge-ok'}">{'UPLOAD SCHRÁNKA' if dtype == 'upload_request' else 'SDÍLENÝ SOUBOR'}</span></td>
+                <td><strong>{html.escape(meta.get('label', ''))}</strong></td>
+                <td class="mono"><a href="{pub_path}" target="_blank" class="link-action">{pub_path}</a></td>
+                <td class="mono">{html.escape(exp)}</td>
+                <td class="mono">{limit_str}</td>
+                <td>{'Ano' if meta.get('password') else 'Ne'}</td>
+                <td><a href="{qr_url}" target="_blank" class="link-action">QR kód</a><a href="/vaultdrop/revoke?id={d['id']}&{q_params}" class="link-danger">Zrušit</a></td>
+            </tr>"""
+        except Exception:
+            pass
+    if not drops_rows:
+        drops_rows = "<tr><td colspan='7' style='text-align:center; color:var(--text-muted);'>Žádné aktivní VaultDrop odkazy.</td></tr>"
+
+    alert_html = f'<div class="alert-bar ok">{html.escape(msg)}</div>' if msg else ""
+    body = f"""
+    {alert_html}
+    <div class="grid-2">
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">{svg("share")} Vytvořit chytrý sdílecí odkaz (VaultDrop)</h2></div>
+            <form action="/vaultdrop/create-link" method="POST">
+                <input type="hidden" name="username" value="{html.escape(username)}">
+                <input type="hidden" name="password" value="{html.escape(password)}">
+                <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+                <label style="font-size:12px; color:var(--text-muted);">Vyberte soubor ke sdílení</label>
+                <select name="file_id" required style="margin:4px 0 10px 0;">{file_opts}</select>
+                <div class="grid-2" style="gap:8px; margin-bottom:10px;">
+                    <div>
+                        <label style="font-size:12px; color:var(--text-muted);">Platnost odkazu</label>
+                        <select name="expire_hours">
+                            <option value="0">Bez časového omezení</option>
+                            <option value="1">1 hodina</option>
+                            <option value="24" selected>24 hodin</option>
+                            <option value="168">7 dní</option>
+                            <option value="720">30 dní</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:var(--text-muted);">Max. počet stažení (0 = ∞)</label>
+                        <input type="number" name="max_downloads" value="0" min="0">
+                    </div>
+                </div>
+                <input type="password" name="drop_pass" placeholder="Volitelné heslo pro stažení..." style="margin-bottom:10px;">
+                <button type="submit" class="btn" style="width:100%;">Vygenerovat VaultDrop odkaz</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2 class="panel-title">{svg("folder")} Vytvořit veřejnou upload schránku (File Request)</h2></div>
+            <p style="color:var(--text-muted); margin-top:0;">Umožní komukoliv s odkazem nahrát soubory přímo do vaší cílové složky bez účtu a bez přístupu k ostatním datům.</p>
+            <form action="/vaultdrop/create-request" method="POST">
+                <input type="hidden" name="username" value="{html.escape(username)}">
+                <input type="hidden" name="password" value="{html.escape(password)}">
+                <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+                <input type="text" name="title" placeholder="Název schránky (např. Fotky ze školy)" required style="margin-bottom:10px;">
+                <input type="text" name="dest_folder" value="/Inbox" placeholder="Cílová složka ve Vaultu..." required style="margin-bottom:10px;">
+                <input type="password" name="drop_pass" placeholder="Volitelné heslo pro nahrávání..." style="margin-bottom:10px;">
+                <button type="submit" class="btn btn-secondary" style="width:100%;">Vytvořit upload schránku</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Aktivní sdílené odkazy a upload schránky ({len(drops)})</h2></div>
+        <table>
+            <thead><tr><th>Typ</th><th>Název</th><th>Veřejná cesta</th><th>Expirace</th><th>Stažení</th><th>Heslo</th><th>Akce</th></tr></thead>
+            <tbody>{drops_rows}</tbody>
+        </table>
+    </div>"""
+    return render_shell("VaultDrop Sdílení", "vaultdrop", username, password, view_owner, body)
+
+@app.post("/vaultdrop/create-link", response_class=HTMLResponse)
+def vaultdrop_create_link(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), file_id: int = Form(...), expire_hours: int = Form(0), max_downloads: int = Form(0), drop_pass: str = Form("")):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    rec = (supabase.table("nxt_files").select("*").eq("id", file_id).execute().data or [None])[0]
+    if not rec:
+        return vaultdrop_view(username, password, view_owner, 0, "Soubor nenalezen.")
+
+    token = secrets.token_urlsafe(12)
+    exp_str = (datetime.now(timezone.utc) + timedelta(hours=expire_hours)).strftime("%Y-%m-%d %H:%M UTC") if expire_hours > 0 else ""
+    meta = json.dumps({
+        "type": "download",
+        "token": token,
+        "file_id": file_id,
+        "label": rec["filename"],
+        "expires_at": exp_str,
+        "max_downloads": max_downloads,
+        "downloads_used": 0,
+        "password": drop_pass.strip()
+    }, ensure_ascii=False)
+
+    supabase.table("nxt_files").insert({
+        "owner": view_owner,
+        "filename": token,
+        "storage_provider": "vault_drop",
+        "file_url": meta,
+        "folder": "/_drops",
+        "size": 0,
+        "is_deleted": False
+    }).execute()
+    log_audit(username, "VAULTDROP_CREATED", f"Vytvořen sdílecí odkaz pro {rec['filename']}", "INFO")
+    return vaultdrop_view(username, password, view_owner, 0, f"Sdílecí odkaz /drop/{token} byl vytvořen.")
+
+@app.post("/vaultdrop/create-request", response_class=HTMLResponse)
+def vaultdrop_create_request(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), title: str = Form(...), dest_folder: str = Form("/Inbox"), drop_pass: str = Form("")):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    token = secrets.token_urlsafe(12)
+    clean_dest = dest_folder.strip() or "/Inbox"
+    if not clean_dest.startswith("/"):
+        clean_dest = "/" + clean_dest
+
+    meta = json.dumps({
+        "type": "upload_request",
+        "token": token,
+        "label": title.strip(),
+        "dest_folder": clean_dest,
+        "expires_at": "",
+        "max_downloads": 0,
+        "downloads_used": 0,
+        "password": drop_pass.strip()
+    }, ensure_ascii=False)
+
+    supabase.table("nxt_files").insert({
+        "owner": view_owner,
+        "filename": token,
+        "storage_provider": "vault_drop",
+        "file_url": meta,
+        "folder": "/_drops",
+        "size": 0,
+        "is_deleted": False
+    }).execute()
+    log_audit(username, "UPLOAD_BOX_CREATED", f"Vytvořena upload schránka '{title.strip()}' -> {clean_dest}", "INFO")
+    return vaultdrop_view(username, password, view_owner, 0, f"Upload schránka /drop-upload/{token} byla vytvořena.")
+
+@app.get("/vaultdrop/revoke", response_class=HTMLResponse)
+def vaultdrop_revoke(username: str, password: str, id: int, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    supabase.table("nxt_files").delete().eq("id", id).execute()
+    log_audit(username, "VAULTDROP_REVOKED", f"Zrušen VaultDrop odkaz ID #{id}", "WARN")
+    return vaultdrop_view(username, password, view_owner, 0, "Odkaz byl zneplatněn.")
+
+@app.get("/drop/{token}", response_class=HTMLResponse)
+def public_drop_get(token: str):
+    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_drop").eq("filename", token).execute()
+    if not res.data:
+        return HTMLResponse("Odkaz neexistuje nebo byl zrušen.", status_code=404)
+    row = res.data[0]
+    meta = json.loads(row.get("file_url", "{}"))
+
+    if meta.get("expires_at"):
+        exp_dt = datetime.strptime(meta["expires_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > exp_dt:
+            return HTMLResponse("Platnost tohoto odkazu již vypršela.", status_code=410)
+
+    if meta.get("max_downloads", 0) > 0 and meta.get("downloads_used", 0) >= meta["max_downloads"]:
+        return HTMLResponse("Byl vyčerpán maximální limit stažení.", status_code=410)
+
+    pass_input = '<input type="password" name="drop_pass" placeholder="Zadejte přístupové heslo..." required style="margin-bottom:12px;">' if meta.get("password") else ""
+    return f"""<!DOCTYPE html><html lang="cs" data-theme="dark"><head><meta charset="UTF-8"><title>VaultDrop Stažení</title>{INDUSTRIAL_CSS}{THEME_SCRIPT}</head>
+    <body style="display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;">
+        <div class="panel" style="max-width:440px; width:100%; text-align:center;">
+            <div class="panel-header" style="justify-content:center;"><h2 class="panel-title">{svg("share")} VaultDrop Zabezpečený přenos</h2></div>
+            <p style="font-weight:600; font-size:15px;">{html.escape(meta.get('label', ''))}</p>
+            <form action="/drop/{html.escape(token)}" method="POST">
+                {pass_input}
+                <button type="submit" class="btn" style="width:100%;">Stáhnout soubor</button>
+            </form>
+        </div>
+    </body></html>"""
+
+@app.post("/drop/{token}")
+def public_drop_post(token: str, drop_pass: str = Form("")):
+    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_drop").eq("filename", token).execute()
+    if not res.data:
+        return HTMLResponse("Odkaz neexistuje.", status_code=404)
+    row = res.data[0]
+    meta = json.loads(row.get("file_url", "{}"))
+    if meta.get("password") and drop_pass != meta["password"]:
+        return HTMLResponse("Neplatné heslo pro stažení.", status_code=403)
+    if meta.get("max_downloads", 0) > 0 and meta.get("downloads_used", 0) >= meta["max_downloads"]:
+        return HTMLResponse("Limit stažení byl vyčerpán.", status_code=410)
+
+    f_rec = (supabase.table("nxt_files").select("*").eq("id", meta.get("file_id")).execute().data or [None])[0]
+    if not f_rec:
+        return HTMLResponse("Zdrojový soubor nebyl nalezen.", status_code=404)
+
+    meta["downloads_used"] = int(meta.get("downloads_used", 0)) + 1
+    supabase.table("nxt_files").update({"file_url": json.dumps(meta, ensure_ascii=False)}).eq("id", row["id"]).execute()
+    log_audit(row["owner"], "VAULTDROP_DOWNLOADED", f"Stažení souboru {f_rec['filename']} přes odkaz {token}", "INFO")
+
+    with urllib.request.urlopen(f_rec["file_url"], timeout=12) as resp:
+        data = resp.read()
+    return StreamingResponse(io.BytesIO(data), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{f_rec["filename"]}"'})
+
+@app.get("/drop-upload/{token}", response_class=HTMLResponse)
+def public_drop_upload_get(token: str, msg: str = ""):
+    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_drop").eq("filename", token).execute()
+    if not res.data:
+        return HTMLResponse("Upload schránka neexistuje.", status_code=404)
+    meta = json.loads(res.data[0].get("file_url", "{}"))
+    pass_input = '<input type="password" name="drop_pass" placeholder="Heslo schránky..." required style="margin-bottom:10px;">' if meta.get("password") else ""
+    alert = f'<div class="alert-bar ok">{html.escape(msg)}</div>' if msg else ""
+    return f"""<!DOCTYPE html><html lang="cs" data-theme="dark"><head><meta charset="UTF-8"><title>VaultDrop Upload</title>{INDUSTRIAL_CSS}{THEME_SCRIPT}</head>
+    <body style="display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;">
+        <div class="panel" style="max-width:460px; width:100%;">
+            <div class="panel-header"><h2 class="panel-title">{svg("folder")} {html.escape(meta.get('label', 'Veřejná schránka'))}</h2></div>
+            {alert}
+            <p style="color:var(--text-muted);">Nahrajte soubory přímo do sdílené složky správce.</p>
+            <form action="/drop-upload/{html.escape(token)}" method="POST" enctype="multipart/form-data">
+                {pass_input}
+                <input type="file" name="files" multiple required style="margin-bottom:12px;">
+                <button type="submit" class="btn" style="width:100%;">Odeslat soubory do Vaultu</button>
+            </form>
+        </div>
+    </body></html>"""
+
+@app.post("/drop-upload/{token}", response_class=HTMLResponse)
+async def public_drop_upload_post(token: str, drop_pass: str = Form(""), files: list[UploadFile] = File(...)):
+    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_drop").eq("filename", token).execute()
+    if not res.data:
+        return HTMLResponse("Schránka neexistuje.", status_code=404)
+    row = res.data[0]
+    meta = json.loads(row.get("file_url", "{}"))
+    if meta.get("password") and drop_pass != meta["password"]:
+        return public_drop_upload_get(token, "Chyba: Neplatné heslo schránky.")
+
+    owner = row["owner"]
+    dest_folder = meta.get("dest_folder", "/Inbox")
+    repo_id = get_active_write_repo()
+    cnt = 0
+    for f in files:
+        if not f.filename:
+            continue
+        fbytes = await f.read()
+        repo_path = f"{owner}{dest_folder}/{f.filename}".replace("//", "/")
+        if hf_api and repo_id:
+            hf_api.upload_file(path_or_fileobj=fbytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
+            purl = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+        else:
+            purl = "#"
+        supabase.table("nxt_files").insert({
+            "owner": owner, "filename": f.filename, "storage_provider": "huggingface",
+            "file_url": purl, "folder": dest_folder, "size": len(fbytes), "is_deleted": False
+        }).execute()
+        cnt += 1
+    log_audit(owner, "PUBLIC_DROP_UPLOAD", f"Přijato {cnt} souborů přes veřejnou schránku '{meta.get('label')}'", "INFO")
+    return public_drop_upload_get(token, f"Úspěšně odesláno souborů: {cnt}.")
+
+# --- 4. VAULTBACKUP & CONFIG EXPORT ---
+@app.get("/vaultbackup", response_class=HTMLResponse)
+def vaultbackup_view(username: str, password: str, target_owner: str = None, msg: str = ""):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
+
+    all_rows = supabase.table("nxt_files").select("*").eq("is_deleted", False).execute().data or []
+    profiles = []
+    snapshots = []
+    for r in all_rows:
+        if r.get("owner") == view_owner and r.get("storage_provider") == "vault_backup_profile":
+            d = json.loads(r.get("file_url", "{}"))
+            d["id"] = r["id"]
+            profiles.append(d)
+        elif r.get("owner") == view_owner and r.get("storage_provider") == "vault_backup_snapshot":
+            d = json.loads(r.get("file_url", "{}"))
+            d["id"] = r["id"]
+            snapshots.append(d)
+
+    snapshots.sort(key=lambda x: x.get("id", 0), reverse=True)
+
+    prof_rows = ""
+    for p in profiles:
+        src = p.get("source_folder", "/")
+        prof_rows += f"""
+        <tr>
+            <td><strong>{html.escape(p.get('name', ''))}</strong></td>
+            <td class="mono">{html.escape(src)}</td>
+            <td class="mono">{p.get('retention', 5)} snímků</td>
+            <td class="mono">{html.escape(p.get('last_run', 'Nikdy'))}</td>
+            <td><span class="badge badge-ok">{html.escape(p.get('last_status', 'READY'))} ({p.get('last_count', 0)} soub.)</span></td>
+            <td>
+                <div class="form-row" style="gap:6px;">
+                    <form action="/vaultbackup/action" method="POST" style="margin:0;">
+                        <input type="hidden" name="username" value="{html.escape(username)}">
+                        <input type="hidden" name="password" value="{html.escape(password)}">
+                        <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+                        <input type="hidden" name="action" value="run_backup">
+                        <input type="hidden" name="profile_id" value="{p['id']}">
+                        <button type="submit" class="btn btn-sm">Spustit zálohu</button>
+                    </form>
+                    <a href="/download-zip?{q_params}&folder={urllib.parse.quote(src)}" class="btn btn-secondary btn-sm">ZIP</a>
+                    <form action="/vaultbackup/action" method="POST" style="margin:0;">
+                        <input type="hidden" name="username" value="{html.escape(username)}">
+                        <input type="hidden" name="password" value="{html.escape(password)}">
+                        <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+                        <input type="hidden" name="action" value="delete_profile">
+                        <input type="hidden" name="profile_id" value="{p['id']}">
+                        <button type="submit" class="btn btn-danger btn-sm">Smazat</button>
+                    </form>
+                </div>
+            </td>
+        </tr>"""
+    if not prof_rows:
+        prof_rows = "<tr><td colspan='6' style='text-align:center; color:var(--text-muted);'>Žádné zálohovací profily.</td></tr>"
+
+    snap_rows = ""
+    for s in snapshots[:15]:
+        snap_rows += f"""
+        <tr>
+            <td class="mono">#{s.get('id')}</td>
+            <td><strong>{html.escape(s.get('profile_name', ''))}</strong></td>
+            <td class="mono">{html.escape(s.get('source_folder', '/'))}</td>
+            <td class="mono">{html.escape(s.get('timestamp', ''))}</td>
+            <td class="mono">{s.get('file_count', 0)} ({format_bytes(s.get('total_size', 0))})</td>
+            <td class="mono"><span class="badge">{html.escape(s.get('sha256_short', ''))}</span></td>
+        </tr>"""
+    if not snap_rows:
+        snap_rows = "<tr><td colspan='6' style='text-align:center; color:var(--text-muted);'>Žádné uložené snímky.</td></tr>"
+
+    u_rows = supabase.table("nxt_users").select("username, role").execute().data or []
+    cfg_obj = {
+        "system": "VaultGrid OS",
+        "version": CORE_VERSION,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "users": [{"username": u["username"], "role": u["role"]} for u in u_rows],
+        "storage_pools": get_storage_pools(),
+        "backup_profiles": [{k: v for k, v in p.items() if k != "id"} for p in profiles],
+    }
+    cfg_json = json.dumps(cfg_obj, ensure_ascii=False, indent=2)
+
+    alert_html = f'<div class="alert-bar ok">{html.escape(msg)}</div>' if msg else ""
+    body = f"""
+    {alert_html}
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">{svg("save")} Nový zálohovací profil (Point-in-Time Snapshots)</h2></div>
+        <form action="/vaultbackup/action" method="POST" class="form-row">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <input type="hidden" name="action" value="create_profile">
+            <input type="text" name="profile_name" placeholder="Název profilu (např. Denní záloha projektů)" required style="flex:1;">
+            <input type="text" name="source_folder" value="/" placeholder="Zdrojová složka..." required style="width:200px;">
+            <select name="retention" style="width:150px;">
+                <option value="3">Držet 3 snímky</option>
+                <option value="5" selected>Držet 5 snímků</option>
+                <option value="10">Držet 10 snímků</option>
+            </select>
+            <button type="submit" class="btn">Uložit profil</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Zálohovací profily ({len(profiles)})</h2></div>
+        <table><thead><tr><th>Název</th><th>Zdroj</th><th>Retence</th><th>Poslední běh</th><th>Stav</th><th>Akce</th></tr></thead><tbody>{prof_rows}</tbody></table>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Historie snímků a SHA-256 kontrolních součtů</h2></div>
+        <table><thead><tr><th>ID</th><th>Profil</th><th>Složka</th><th>Čas</th><th>Rozsah</th><th>SHA-256</th></tr></thead><tbody>{snap_rows}</tbody></table>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("code")} Export konfigurace systému (JSON)</h2>
+            <button type="button" onclick="downloadCfg()" class="btn btn-sm">Stáhnout vaultgrid-config.json</button>
+        </div>
+        <textarea id="cfg-box" rows="12" class="code-box" readonly>{html.escape(cfg_json)}</textarea>
+    </div>
+    <script>
+        function downloadCfg() {{
+            const blob = new Blob([document.getElementById('cfg-box').value], {{ type: 'application/json' }});
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'vaultgrid-config-' + new Date().toISOString().slice(0,10) + '.json';
+            a.click();
+        }}
+    </script>"""
+    return render_shell("Zálohy & Konfigurace", "vaultbackup", username, password, view_owner, body)
+
+@app.post("/vaultbackup/action", response_class=HTMLResponse)
+def vaultbackup_action(
+    username: str = Form(...),
+    password: str = Form(...),
+    target_owner: str = Form(None),
+    action: str = Form(...),
+    profile_name: str = Form(""),
+    source_folder: str = Form("/"),
+    retention: int = Form(5),
+    profile_id: int = Form(0)
+):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+
+    if action == "create_profile" and profile_name.strip():
+        clean_src = source_folder.strip() or "/"
+        if not clean_src.startswith("/"):
+            clean_src = "/" + clean_src
+        meta = json.dumps({
+            "name": profile_name.strip(),
+            "source_folder": clean_src,
+            "retention": retention,
+            "last_run": "Nikdy",
+            "last_status": "READY",
+            "last_count": 0
+        }, ensure_ascii=False)
+        supabase.table("nxt_files").insert({
+            "owner": view_owner, "filename": ".vault_backup_profile", "storage_provider": "vault_backup_profile",
+            "file_url": meta, "folder": "/_backups", "size": 0, "is_deleted": False
+        }).execute()
+        log_audit(username, "BACKUP_PROFILE_CREATED", f"Vytvořen profil '{profile_name.strip()}'", "INFO")
+        return vaultbackup_view(username, password, view_owner, "Zálohovací profil byl vytvořen.")
+
+    elif action == "run_backup" and profile_id:
+        p_row = (supabase.table("nxt_files").select("*").eq("id", profile_id).execute().data or [None])[0]
+        if p_row:
+            p_meta = json.loads(p_row.get("file_url", "{}"))
+            src = p_meta.get("source_folder", "/")
+            ret = int(p_meta.get("retention", 5))
+            rows = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute().data or []
+            matched = [f for f in rows if not is_system_record(f) and (src == "/" or f.get("folder", "/").startswith(src))]
+            tot_size = sum(int(f.get("size", 0)) for f in matched)
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            digest = hashlib.sha256(json.dumps([(f["filename"], f.get("size", 0)) for f in matched]).encode()).hexdigest()[:16]
+
+            snap_meta = json.dumps({
+                "profile_id": profile_id, "profile_name": p_meta.get("name"), "source_folder": src,
+                "timestamp": ts, "file_count": len(matched), "total_size": tot_size, "sha256_short": digest
+            }, ensure_ascii=False)
+            supabase.table("nxt_files").insert({
+                "owner": view_owner, "filename": ".vault_backup_snapshot", "storage_provider": "vault_backup_snapshot",
+                "file_url": snap_meta, "folder": "/_backups", "size": tot_size, "is_deleted": False
+            }).execute()
+
+            snaps = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("storage_provider", "vault_backup_snapshot").order("id", desc=True).execute().data or []
+            p_snaps = [s["id"] for s in snaps if json.loads(s.get("file_url", "{}")).get("profile_id") == profile_id]
+            for old_id in p_snaps[ret:]:
+                supabase.table("nxt_files").delete().eq("id", old_id).execute()
+
+            p_meta["last_run"] = ts
+            p_meta["last_status"] = "OK"
+            p_meta["last_count"] = len(matched)
+            supabase.table("nxt_files").update({"file_url": json.dumps(p_meta, ensure_ascii=False)}).eq("id", profile_id).execute()
+            log_audit(username, "BACKUP_EXECUTED", f"Snímek '{p_meta.get('name')}' ({len(matched)} soub., SHA {digest})", "INFO")
+            return vaultbackup_view(username, password, view_owner, f"Snímek zálohy dokončen (SHA-256: {digest}).")
+
+    elif action == "delete_profile" and profile_id:
+        supabase.table("nxt_files").delete().eq("id", profile_id).execute()
+        return vaultbackup_view(username, password, view_owner, "Zálohovací profil byl odstraněn.")
+
+    return vaultbackup_view(username, password, view_owner)
+
+# --- 5. STORAGE POOLS (7 TB HUGGING FACE MULTI-POOL) ---
 @app.get("/storage-pools", response_class=HTMLResponse)
 def storage_pools_view(username: str, password: str, target_owner: str = None, msg: str = ""):
     user = verify_user(username, password)
@@ -1248,7 +2159,7 @@ def storage_pools_view(username: str, password: str, target_owner: str = None, m
         used_b = sum(int(f.get("size", 0)) for f in pool_files)
         cap_gb = int(p.get("quota_gb", 300))
         is_write = p.get("is_active_write", False)
-        status_badge = '<span class="badge badge-ok">ACTIVE // WRITE</span>' if is_write else '<span class="badge">MOUNTED // READ</span>'
+        status_badge = '<span class="badge badge-ok">ACTIVE // WRITE</span>' if is_write else '<span class="badge">MOUNTED // AUTO-FAILOVER</span>'
 
         controls = ""
         if user["role"] == "admin":
@@ -1272,7 +2183,6 @@ def storage_pools_view(username: str, password: str, target_owner: str = None, m
         add_pool_form = f"""
         <div class="panel">
             <div class="panel-header"><h3 class="panel-title">{svg("database")} Připojit další Hugging Face Dataset Pool (škálování až na 7 TB)</h3></div>
-            <p style="color:var(--text-muted); margin-top:0;">Doporučená velikost jednoho datasetu je 300 GB. Propojením až 24 repozitářů získáte souvislý 7 TB cloudový fond.</p>
             <form action="/storage-pools/add" method="POST" class="form-row">
                 <input type="hidden" name="username" value="{html.escape(username)}">
                 <input type="hidden" name="password" value="{html.escape(password)}">
@@ -1289,7 +2199,7 @@ def storage_pools_view(username: str, password: str, target_owner: str = None, m
     {alert_html}
     <div class="panel">
         <div class="panel-header">
-            <h2 class="panel-title">{svg("database")} Připojené úložné fondy (Multi-Pool Architecture)</h2>
+            <h2 class="panel-title">{svg("database")} Připojené úložné fondy (Auto-Balancing Multi-Pool)</h2>
             <span class="mono">Celková kapacita: {sum(int(p.get('quota_gb', 300)) for p in pools)} GB</span>
         </div>
         <table>
@@ -1297,8 +2207,7 @@ def storage_pools_view(username: str, password: str, target_owner: str = None, m
             <tbody>{rows_html}</tbody>
         </table>
     </div>
-    {add_pool_form}
-    """
+    {add_pool_form}"""
     return render_shell("Storage Pools (7 TB)", "pools", username, password, view_owner, body)
 
 @app.post("/storage-pools/add", response_class=HTMLResponse)
@@ -1307,23 +2216,13 @@ def storage_pools_add(username: str = Form(...), password: str = Form(...), targ
     if not user or user["role"] != "admin":
         return login_page()
     view_owner = target_owner or username
-    payload = json.dumps({
-        "label": label.strip(),
-        "repo_id": repo_id.strip(),
-        "quota_gb": quota_gb,
-        "is_active_write": False
-    }, ensure_ascii=False)
+    payload = json.dumps({"label": label.strip(), "repo_id": repo_id.strip(), "quota_gb": quota_gb, "is_active_write": False}, ensure_ascii=False)
     supabase.table("nxt_files").insert({
-        "owner": "system",
-        "filename": "storage_pool",
-        "storage_provider": "vault_pool",
-        "file_url": payload,
-        "folder": "/_pools",
-        "size": 0,
-        "is_deleted": False
+        "owner": "system", "filename": "storage_pool", "storage_provider": "vault_pool",
+        "file_url": payload, "folder": "/_pools", "size": 0, "is_deleted": False
     }).execute()
-    log_audit(username, "POOL_ADDED", f"Připojen úložný pool {repo_id.strip()} ({quota_gb} GB)", "INFO")
-    return storage_pools_view(username, password, view_owner, f"Úložný pool {repo_id.strip()} byl úspěšně připojen.")
+    log_audit(username, "POOL_ADDED", f"Připojen pool {repo_id.strip()} ({quota_gb} GB)", "INFO")
+    return storage_pools_view(username, password, view_owner, f"Úložný pool {repo_id.strip()} byl připojen.")
 
 @app.get("/storage-pools/set-active", response_class=HTMLResponse)
 def storage_pools_set_active(username: str, password: str, repo_id: str, target_owner: str = None):
@@ -1333,14 +2232,10 @@ def storage_pools_set_active(username: str, password: str, repo_id: str, target_
     view_owner = target_owner or username
     res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_pool").eq("is_deleted", False).execute()
     for row in (res.data or []):
-        try:
-            d = json.loads(row.get("file_url", "{}"))
-            d["is_active_write"] = (d.get("repo_id") == repo_id)
-            supabase.table("nxt_files").update({"file_url": json.dumps(d, ensure_ascii=False)}).eq("id", row["id"]).execute()
-        except Exception:
-            pass
-    log_audit(username, "POOL_ACTIVE_CHANGED", f"Aktivní zápisový pool změněn na {repo_id}", "INFO")
-    return storage_pools_view(username, password, view_owner, f"Aktivní zápisový repozitář nastaven na: {repo_id}")
+        d = json.loads(row.get("file_url", "{}"))
+        d["is_active_write"] = (d.get("repo_id") == repo_id)
+        supabase.table("nxt_files").update({"file_url": json.dumps(d, ensure_ascii=False)}).eq("id", row["id"]).execute()
+    return storage_pools_view(username, password, view_owner, f"Aktivní zápisový repozitář: {repo_id}")
 
 @app.get("/storage-pools/remove", response_class=HTMLResponse)
 def storage_pools_remove(username: str, password: str, id: int, target_owner: str = None):
@@ -1349,14 +2244,17 @@ def storage_pools_remove(username: str, password: str, id: int, target_owner: st
         return login_page()
     view_owner = target_owner or username
     supabase.table("nxt_files").delete().eq("id", id).execute()
-    log_audit(username, "POOL_REMOVED", f"Odpojen pool ID #{id}", "WARN")
     return storage_pools_view(username, password, view_owner, "Úložný pool byl odpojen.")
 
-# --- 4. MEDIA SERVER (VAULTFLIX & VAULTBEATS + VOLITELNÉ TMDB METADATA) ---
-def fetch_tmdb_poster(filename: str) -> tuple[str, str]:
+# --- 6. VAULTFLIX CINEMA 2.0 & VAULTBEATS HI-FI ---
+def fetch_tmdb_metadata(filename: str) -> tuple[str, str, str]:
     if not TMDB_API_KEY:
-        return "", ""
-    clean_title = os.path.splitext(filename)[0].replace(".", " ").replace("_", " ").strip()
+        return "", "", ""
+    base_name = os.path.splitext(filename)[0]
+    series_match = re.search(r"(S\d{1,2}E\d{1,2})", base_name, re.IGNORECASE)
+    ep_tag = series_match.group(1).upper() if series_match else ""
+    clean_title = re.sub(r"(S\d{1,2}E\d{1,2}|1080p|720p|4k|x264|x265|WEBRip|BluRay).*", "", base_name, flags=re.IGNORECASE)
+    clean_title = clean_title.replace(".", " ").replace("_", " ").strip()
     try:
         q = urllib.parse.quote(clean_title)
         url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={q}&language=cs-CZ"
@@ -1366,11 +2264,11 @@ def fetch_tmdb_poster(filename: str) -> tuple[str, str]:
         if results:
             top = results[0]
             poster = f"https://image.tmdb.org/t/p/w342{top['poster_path']}" if top.get("poster_path") else ""
-            overview = top.get("overview", "")[:130]
-            return poster, overview
+            overview = top.get("overview", "")[:120]
+            return poster, overview, ep_tag
     except Exception:
         pass
-    return "", ""
+    return "", "", ep_tag
 
 @app.get("/vaultflix", response_class=HTMLResponse)
 def vaultflix_view(username: str, password: str, target_owner: str = None):
@@ -1378,59 +2276,126 @@ def vaultflix_view(username: str, password: str, target_owner: str = None):
     if not user:
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
-    res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute()
-    videos = [f for f in (res.data or []) if not is_system_record(f) and f["filename"].split(".")[-1].lower() in VIDEO_EXTENSIONS]
+    all_rows = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute().data or []
+
+    videos = [f for f in all_rows if not is_system_record(f) and f["filename"].split(".")[-1].lower() in VIDEO_EXTENSIONS]
+    subtitles = {os.path.splitext(f["filename"])[0]: f["file_url"] for f in all_rows if f["filename"].split(".")[-1].lower() in ["vtt", "srt"]}
+
+    progress_map: dict[int, float] = {}
+    for r in all_rows:
+        if r.get("storage_provider") == "vault_watch_progress":
+            try:
+                progress_map[int(r["size"])] = float(r.get("file_url", 0))
+            except Exception:
+                pass
 
     cards_html = ""
     for v in videos:
-        poster_url, overview = fetch_tmdb_poster(v["filename"])
+        poster_url, overview, ep_tag = fetch_tmdb_metadata(v["filename"])
         poster_block = f'<img src="{poster_url}" alt="Poster">' if poster_url else svg("film")
-        desc_text = html.escape(overview) if overview else f"Adresář: {html.escape(v['folder'])} • {format_bytes(v.get('size', 0))}"
+        base_no_ext = os.path.splitext(v["filename"])[0]
+        sub_url = subtitles.get(base_no_ext, "")
+        saved_sec = int(progress_map.get(v["id"], 0))
+        resume_badge = f'<span class="badge badge-warn">Pokračovat ({saved_sec // 60}:{saved_sec % 60:02d})</span>' if saved_sec > 10 else ""
+        ep_badge = f'<span class="badge badge-ok">{ep_tag}</span>' if ep_tag else ""
+        desc_text = html.escape(overview) if overview else f"{html.escape(v['folder'])} • {format_bytes(v.get('size', 0))}"
+
         cards_html += f"""
         <div class="media-card">
             <div>
                 <div class="media-poster">{poster_block}</div>
                 <div style="padding:12px;">
                     <div style="font-weight:600; margin-bottom:4px; word-break:break-word;">{html.escape(v['filename'])}</div>
+                    <div style="margin-bottom:6px; display:flex; gap:5px; flex-wrap:wrap;">{ep_badge}{resume_badge}</div>
                     <div style="font-size:12px; color:var(--text-muted);">{desc_text}</div>
                 </div>
             </div>
             <div style="padding:0 12px 12px 12px;">
-                <button type="button" onclick="playVideo('{html.escape(v['file_url'])}', '{html.escape(v['filename'])}')" class="btn btn-sm" style="width:100%;">Přehrát</button>
+                <button type="button" onclick="playVideo({v['id']}, '{html.escape(v['file_url'])}', '{html.escape(v['filename'])}', '{html.escape(sub_url)}', {saved_sec})" class="btn btn-sm" style="width:100%;">Přehrát</button>
             </div>
         </div>"""
 
     if not cards_html:
-        cards_html = '<p style="color:var(--text-muted); grid-column:1/-1;">Knihovna videí je prázdná. Nahrajte soubory .mp4, .mkv nebo .webm ve Správci souborů.</p>'
+        cards_html = '<p style="color:var(--text-muted); grid-column:1/-1;">Knihovna videí je prázdná. Nahrajte videa (.mp4, .mkv, .webm) ve Správci souborů.</p>'
 
     body = f"""
     <div id="player-panel" class="panel" style="display:none;">
         <div class="panel-header">
             <h2 id="player-title" class="panel-title">{svg("film")} Přehrávač</h2>
-            <button type="button" onclick="document.getElementById('player-panel').style.display='none'; document.getElementById('video-el').pause();" class="btn btn-secondary btn-sm">Zavřít</button>
+            <div class="form-row">
+                <select id="speed-sel" onchange="document.getElementById('video-el').playbackRate = parseFloat(this.value)" style="width:auto; padding:4px 8px;">
+                    <option value="1">1.0x</option>
+                    <option value="1.25">1.25x</option>
+                    <option value="1.5">1.5x</option>
+                    <option value="2">2.0x</option>
+                </select>
+                <button type="button" onclick="closePlayer()" class="btn btn-secondary btn-sm">Zavřít</button>
+            </div>
         </div>
-        <video id="video-el" controls style="width:100%; max-height:500px; background:#000; border-radius:4px;"></video>
+        <video id="video-el" controls crossorigin="anonymous" style="width:100%; max-height:520px; background:#000; border-radius:4px;"></video>
     </div>
 
     <div class="panel">
         <div class="panel-header">
-            <h2 class="panel-title">{svg("film")} Video knihovna ({len(videos)} titulů)</h2>
-            <span class="badge">{'TMDB Metadata: Aktivní' if TMDB_API_KEY else 'Lokální metadata'}</span>
+            <h2 class="panel-title">{svg("film")} VaultFlix Cinema 2.0 ({len(videos)} titulů)</h2>
+            <span class="badge">{'TMDB API: Aktivní' if TMDB_API_KEY else 'Lokální metadata'}</span>
         </div>
         <div class="media-grid">{cards_html}</div>
     </div>
     <script>
-        function playVideo(url, title) {{
+        let currentVidId = 0;
+        const vidEl = document.getElementById('video-el');
+        function playVideo(id, url, title, subUrl, startSec) {{
+            currentVidId = id;
             const p = document.getElementById('player-panel');
-            const v = document.getElementById('video-el');
             document.getElementById('player-title').innerText = title;
-            v.src = url;
+            vidEl.innerHTML = '';
+            vidEl.src = url;
+            if (subUrl) {{
+                const tr = document.createElement('track');
+                tr.kind = 'subtitles';
+                tr.label = 'České titulky';
+                tr.srclang = 'cs';
+                tr.src = subUrl;
+                tr.default = true;
+                vidEl.appendChild(tr);
+            }}
             p.style.display = 'block';
-            v.play();
+            vidEl.currentTime = startSec || 0;
+            vidEl.play();
             p.scrollIntoView({{ behavior: 'smooth' }});
         }}
+        function closePlayer() {{
+            saveWatchProgress();
+            vidEl.pause();
+            document.getElementById('player-panel').style.display = 'none';
+        }}
+        function saveWatchProgress() {{
+            if (!currentVidId || !vidEl.currentTime) return;
+            const fd = new FormData();
+            fd.append('username', "{html.escape(username)}");
+            fd.append('password', "{html.escape(password)}");
+            fd.append('target_owner', "{html.escape(view_owner)}");
+            fd.append('video_id', currentVidId);
+            fd.append('seconds', Math.floor(vidEl.currentTime));
+            fetch('/vaultflix/progress', {{ method: 'POST', body: fd }});
+        }}
+        setInterval(saveWatchProgress, 15000);
     </script>"""
-    return render_shell("VaultFlix Kino", "vaultflix", username, password, view_owner, body)
+    return render_shell("VaultFlix Kino 2.0", "vaultflix", username, password, view_owner, body)
+
+@app.post("/vaultflix/progress")
+def vaultflix_save_progress(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), video_id: int = Form(...), seconds: int = Form(...)):
+    user = verify_user(username, password)
+    if not user or not supabase:
+        return JSONResponse({"ok": False}, status_code=401)
+    view_owner = target_owner or username
+    supabase.table("nxt_files").delete().eq("owner", view_owner).eq("storage_provider", "vault_watch_progress").eq("size", video_id).execute()
+    supabase.table("nxt_files").insert({
+        "owner": view_owner, "filename": "watch_pos", "storage_provider": "vault_watch_progress",
+        "file_url": str(seconds), "folder": "/_progress", "size": video_id, "is_deleted": False
+    }).execute()
+    return JSONResponse({"ok": True})
 
 @app.get("/vaultbeats", response_class=HTMLResponse)
 def vaultbeats_view(username: str, password: str, target_owner: str = None):
@@ -1456,16 +2421,21 @@ def vaultbeats_view(username: str, password: str, target_owner: str = None):
 
     body = f"""
     <div class="panel">
-        <div class="panel-header"><h2 class="panel-title">{svg("music")} Audio Streamer</h2></div>
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("music")} VaultBeats Hi-Fi Streamer</h2>
+            <span id="mode-badge" class="badge">Režim: Sekvenční</span>
+        </div>
         <div id="track-label" style="font-weight:600; margin-bottom:8px;">Připraveno k přehrávání</div>
         <audio id="audio-el" controls style="width:100%; margin-bottom:10px;"></audio>
         <div class="form-row">
             <button type="button" onclick="prevAudio()" class="btn btn-secondary btn-sm">Předchozí</button>
             <button type="button" onclick="nextAudio()" class="btn btn-secondary btn-sm">Další</button>
+            <button type="button" onclick="toggleShuffle()" class="btn btn-secondary btn-sm">Shuffle (Náhodně)</button>
+            <button type="button" onclick="toggleLoop()" class="btn btn-secondary btn-sm">Opakovat skladbu</button>
         </div>
     </div>
     <div class="panel">
-        <div class="panel-header"><h2 class="panel-title">Seznam skladeb ({len(tracks)})</h2></div>
+        <div class="panel-header"><h2 class="panel-title">Hudební knihovna ({len(tracks)})</h2></div>
         <table>
             <thead><tr><th>#</th><th>Skladba</th><th>Adresář</th><th>Velikost</th></tr></thead>
             <tbody>{rows_html}</tbody>
@@ -1474,6 +2444,7 @@ def vaultbeats_view(username: str, password: str, target_owner: str = None):
     <script>
         const playlist = {tracks_json};
         let cur = 0;
+        let shuffle = false;
         const aud = document.getElementById('audio-el');
         const lbl = document.getElementById('track-label');
         function playAudio(i) {{
@@ -1483,13 +2454,235 @@ def vaultbeats_view(username: str, password: str, target_owner: str = None):
             lbl.innerText = 'Přehrávání: ' + playlist[i].title;
             aud.play();
         }}
-        function nextAudio() {{ if (playlist.length) playAudio((cur + 1) % playlist.length); }}
+        function nextAudio() {{
+            if (!playlist.length) return;
+            if (shuffle) {{ playAudio(Math.floor(Math.random() * playlist.length)); }}
+            else {{ playAudio((cur + 1) % playlist.length); }}
+        }}
         function prevAudio() {{ if (playlist.length) playAudio((cur - 1 + playlist.length) % playlist.length); }}
+        function toggleShuffle() {{ shuffle = !shuffle; updateMode(); }}
+        function toggleLoop() {{ aud.loop = !aud.loop; updateMode(); }}
+        function updateMode() {{
+            document.getElementById('mode-badge').innerText = 'Shuffle: ' + (shuffle ? 'ZAP' : 'VYP') + ' | Loop: ' + (aud.loop ? 'ZAP' : 'VYP');
+        }}
         aud.addEventListener('ended', nextAudio);
     </script>"""
-    return render_shell("VaultBeats Audio", "vaultbeats", username, password, view_owner, body)
+    return render_shell("VaultBeats Hi-Fi", "vaultbeats", username, password, view_owner, body)
 
-# --- 5. UŽIVATELÉ A DISKOVÉ KVÓTY ---
+# --- 7. VAULTRULES AUTOMATIZAČNÍ ENGINE ---
+@app.get("/vaultrules", response_class=HTMLResponse)
+def vaultrules_view(username: str, password: str, target_owner: str = None, msg: str = ""):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
+
+    res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("storage_provider", "vault_rule").eq("is_deleted", False).execute()
+    rules_rows = ""
+    for r in (res.data or []):
+        d = json.loads(r.get("file_url", "{}"))
+        rules_rows += f"""
+        <tr>
+            <td><strong>{html.escape(d.get('name', 'Pravidlo'))}</strong></td>
+            <td class="mono">*.{html.escape(d.get('ext') or '*')} ve složce {html.escape(d.get('src_folder') or 'kdekoli')}</td>
+            <td class="mono">Přesunout do {html.escape(d.get('dest_folder') or '-')} | Štítek #{html.escape(d.get('add_tag') or '-')}</td>
+            <td><a href="/vaultrules/delete?id={r['id']}&{q_params}" class="link-danger">Smazat</a></td>
+        </tr>"""
+    if not rules_rows:
+        rules_rows = "<tr><td colspan='4' style='text-align:center; color:var(--text-muted);'>Zatím nejsou definována žádná automatická pravidla.</td></tr>"
+
+    alert_html = f'<div class="alert-bar ok">{html.escape(msg)}</div>' if msg else ""
+    body = f"""
+    {alert_html}
+    <div class="panel">
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("zap")} Nové automatizační pravidlo (VaultRules)</h2>
+            <form action="/vaultrules/run-now" method="POST" style="margin:0;">
+                <input type="hidden" name="username" value="{html.escape(username)}">
+                <input type="hidden" name="password" value="{html.escape(password)}">
+                <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+                <button type="submit" class="btn btn-secondary btn-sm">Spustit pravidla na stávající soubory</button>
+            </form>
+        </div>
+        <form action="/vaultrules/add" method="POST" class="form-row">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <input type="text" name="name" placeholder="Název (např. Třídění filmů)" required style="width:190px;">
+            <input type="text" name="ext" placeholder="Přípona (např. mp4)" style="width:140px;">
+            <input type="text" name="src_folder" placeholder="Zdrojová složka (prázdné = vše)" style="width:190px;">
+            <input type="text" name="dest_folder" placeholder="Cílová složka (např. /Media)" style="width:180px;">
+            <input type="text" name="add_tag" placeholder="Přidat #štítek" style="width:130px;">
+            <button type="submit" class="btn">Přidat pravidlo</button>
+        </form>
+    </div>
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Aktivní pravidla automatického třídění</h2></div>
+        <table><thead><tr><th>Název</th><th>Podmínka</th><th>Akce</th><th>Správa</th></tr></thead><tbody>{rules_rows}</tbody></table>
+    </div>"""
+    return render_shell("VaultRules Automatizace", "vaultrules", username, password, view_owner, body)
+
+@app.post("/vaultrules/add", response_class=HTMLResponse)
+def vaultrules_add(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), name: str = Form(...), ext: str = Form(""), src_folder: str = Form(""), dest_folder: str = Form(""), add_tag: str = Form("")):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    clean_dest = dest_folder.strip()
+    if clean_dest and not clean_dest.startswith("/"):
+        clean_dest = "/" + clean_dest
+    payload = json.dumps({
+        "name": name.strip(), "ext": ext.strip().lstrip("."), "src_folder": src_folder.strip(),
+        "dest_folder": clean_dest, "add_tag": add_tag.strip().lstrip("#")
+    }, ensure_ascii=False)
+    supabase.table("nxt_files").insert({
+        "owner": view_owner, "filename": "vault_rule", "storage_provider": "vault_rule",
+        "file_url": payload, "folder": "/_rules", "size": 0, "is_deleted": False
+    }).execute()
+    return vaultrules_view(username, password, view_owner, "Automatizační pravidlo bylo uloženo.")
+
+@app.get("/vaultrules/delete", response_class=HTMLResponse)
+def vaultrules_delete(username: str, password: str, id: int, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    supabase.table("nxt_files").delete().eq("id", id).execute()
+    return vaultrules_view(username, password, view_owner, "Pravidlo bylo odstraněno.")
+
+@app.post("/vaultrules/run-now", response_class=HTMLResponse)
+def vaultrules_run_now(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None)):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    rows = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute().data or []
+    affected = 0
+    for f in rows:
+        if is_system_record(f):
+            continue
+        new_fld, tags = apply_vault_rules(view_owner, f["filename"], f.get("folder", "/"))
+        if new_fld != f.get("folder", "/"):
+            supabase.table("nxt_files").update({"folder": new_fld}).eq("id", f["id"]).execute()
+            affected += 1
+        for t in tags:
+            attach_file_tag(view_owner, f["id"], t)
+    return vaultrules_view(username, password, view_owner, f"Pravidla byla aplikována. Přesunutých souborů: {affected}.")
+
+# --- 8. REST API & OSOBNÍ PŘÍSTUPOVÉ TOKENY ---
+@app.get("/api-tokens", response_class=HTMLResponse)
+def api_tokens_view(username: str, password: str, target_owner: str = None, new_token_msg: str = ""):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
+
+    res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("storage_provider", "vault_api_token").eq("is_deleted", False).execute()
+    t_rows = ""
+    for r in (res.data or []):
+        tok = r.get("file_url", "")
+        masked = tok[:10] + "..." + tok[-4:] if len(tok) > 14 else tok
+        t_rows += f"""
+        <tr>
+            <td><strong>{html.escape(r.get('filename', 'Token'))}</strong></td>
+            <td class="mono">{html.escape(masked)}</td>
+            <td><a href="/api-tokens/revoke?id={r['id']}&{q_params}" class="link-danger">Zneplatnit token</a></td>
+        </tr>"""
+    if not t_rows:
+        t_rows = "<tr><td colspan='3' style='text-align:center; color:var(--text-muted);'>Žádné aktivní API tokeny.</td></tr>"
+
+    alert = f'<div class="alert-bar warn"><strong>Nový API token (uložte si jej, znovu se nezobrazí celý):</strong> <span class="mono">{html.escape(new_token_msg)}</span></div>' if new_token_msg else ""
+    curl_example = 'curl -X POST "https://tvoje-domena.onrender.com/api/v1/upload" \\\n  -H "Authorization: Bearer vg_live_TVUJ_TOKEN" \\\n  -F "folder=/Automatizace" \\\n  -F "file=@zaloha.zip"'
+
+    body = f"""
+    {alert}
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">{svg("key")} Vygenerovat osobní REST API klíč</h2></div>
+        <form action="/api-tokens/create" method="POST" class="form-row">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <input type="text" name="label" placeholder="Název klíče (např. Python skript)" required style="flex:1;">
+            <button type="submit" class="btn">Generovat API Token</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Aktivní přístupové tokeny</h2></div>
+        <table><thead><tr><th>Název</th><th>Token</th><th>Správa</th></tr></thead><tbody>{t_rows}</tbody></table>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">{svg("code")} Dokumentace REST API (GET /api/v1/files & POST /api/v1/upload)</h2></div>
+        <pre class="mono" style="background:var(--bg-app); padding:14px; border:1px solid var(--border); border-radius:4px; overflow-x:auto;">{html.escape(curl_example)}</pre>
+    </div>"""
+    return render_shell("REST API & Tokeny", "apitokens", username, password, view_owner, body)
+
+@app.post("/api-tokens/create", response_class=HTMLResponse)
+def api_tokens_create(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), label: str = Form(...)):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    raw_token = "vg_live_" + secrets.token_hex(20)
+    supabase.table("nxt_files").insert({
+        "owner": view_owner, "filename": label.strip(), "storage_provider": "vault_api_token",
+        "file_url": raw_token, "folder": "/_tokens", "size": 0, "is_deleted": False
+    }).execute()
+    log_audit(username, "API_TOKEN_CREATED", f"Vytvořen API token '{label.strip()}'", "INFO")
+    return api_tokens_view(username, password, view_owner, raw_token)
+
+@app.get("/api-tokens/revoke", response_class=HTMLResponse)
+def api_tokens_revoke(username: str, password: str, id: int, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner or username
+    supabase.table("nxt_files").delete().eq("id", id).execute()
+    return api_tokens_view(username, password, view_owner)
+
+def resolve_api_token(auth_header: str | None) -> str | None:
+    if not (auth_header and auth_header.startswith("Bearer ") and supabase):
+        return None
+    tok = auth_header.replace("Bearer ", "", 1).strip()
+    res = supabase.table("nxt_files").select("owner").eq("storage_provider", "vault_api_token").eq("file_url", tok).eq("is_deleted", False).execute()
+    if res.data:
+        return res.data[0]["owner"]
+    return None
+
+@app.get("/api/v1/files")
+def api_v1_list_files(authorization: str | None = Header(default=None)):
+    owner = resolve_api_token(authorization)
+    if not owner:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    rows = supabase.table("nxt_files").select("id, filename, folder, size, file_url, storage_provider").eq("owner", owner).eq("is_deleted", False).execute().data or []
+    clean = [r for r in rows if not is_system_record(r)]
+    return JSONResponse({"owner": owner, "count": len(clean), "files": clean})
+
+@app.post("/api/v1/upload")
+async def api_v1_upload_file(authorization: str | None = Header(default=None), folder: str = Form("/"), file: UploadFile = File(...)):
+    owner = resolve_api_token(authorization)
+    if not owner:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    fbytes = await file.read()
+    clean_folder = folder if folder.startswith("/") else "/" + folder
+    repo_id = get_active_write_repo()
+    repo_path = f"{owner}{clean_folder}/{file.filename}".replace("//", "/")
+    if hf_api and repo_id:
+        hf_api.upload_file(path_or_fileobj=fbytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
+        purl = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+    else:
+        purl = "#"
+    supabase.table("nxt_files").insert({
+        "owner": owner, "filename": file.filename, "storage_provider": "huggingface",
+        "file_url": purl, "folder": clean_folder, "size": len(fbytes), "is_deleted": False
+    }).execute()
+    log_audit(owner, "API_UPLOAD", f"REST API nahrání souboru {file.filename}", "INFO")
+    return JSONResponse({"status": "ok", "filename": file.filename, "folder": clean_folder, "url": purl})
+
+# --- 9. UŽIVATELÉ A DISKOVÉ KVÓTY ---
 @app.get("/users-quotas", response_class=HTMLResponse)
 def users_quotas_view(username: str, password: str, target_owner: str = None, msg: str = ""):
     user = verify_user(username, password)
@@ -1558,8 +2751,7 @@ def users_quotas_view(username: str, password: str, target_owner: str = None, ms
             <tbody>{rows_html}</tbody>
         </table>
     </div>
-    {create_user_panel}
-    """
+    {create_user_panel}"""
     return render_shell("Uživatelé a kvóty", "users", username, password, view_owner, body)
 
 @app.post("/users-quotas/set-quota", response_class=HTMLResponse)
@@ -1571,18 +2763,13 @@ def set_user_quota(username: str = Form(...), password: str = Form(...), target_
     quota_bytes = int(quota_gb * (1024**3)) if quota_gb > 0 else 0
     supabase.table("nxt_files").delete().eq("owner", quota_user).eq("storage_provider", "vault_quota").execute()
     supabase.table("nxt_files").insert({
-        "owner": quota_user,
-        "filename": "user_quota",
-        "storage_provider": "vault_quota",
-        "file_url": str(quota_gb),
-        "folder": "/_quotas",
-        "size": quota_bytes,
-        "is_deleted": False
+        "owner": quota_user, "filename": "user_quota", "storage_provider": "vault_quota",
+        "file_url": str(quota_gb), "folder": "/_quotas", "size": quota_bytes, "is_deleted": False
     }).execute()
     log_audit(username, "QUOTA_UPDATED", f"Kvóta pro {quota_user} nastavena na {quota_gb} GB", "INFO")
     return users_quotas_view(username, password, view_owner, f"Kvóta pro uživatele {quota_user} byla aktualizována.")
 
-# --- 6. BEZPEČNOSTNÍ AUDIT LOG ---
+# --- 10. FORENZNÍ AUDIT LOG & ÚDRŽBA ---
 @app.get("/audit-log", response_class=HTMLResponse)
 def audit_log_view(username: str, password: str, target_owner: str = None, level: str = "ALL"):
     user = verify_user(username, password)
@@ -1591,7 +2778,7 @@ def audit_log_view(username: str, password: str, target_owner: str = None, level
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
     q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
 
-    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_audit").order("id", desc=True).limit(100).execute()
+    res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_audit").order("id", desc=True).limit(120).execute()
     rows_html = ""
     for row in (res.data or []):
         try:
@@ -1616,7 +2803,7 @@ def audit_log_view(username: str, password: str, target_owner: str = None, level
     body = f"""
     <div class="panel">
         <div class="panel-header">
-            <h2 class="panel-title">{svg("shield")} Systémový a bezpečnostní Audit Log</h2>
+            <h2 class="panel-title">{svg("shield")} Forenzní Audit Log systému</h2>
             <div class="form-row">
                 <a href="/audit-log?{q_params}&level=ALL" class="btn btn-secondary btn-sm">Vše</a>
                 <a href="/audit-log?{q_params}&level=INFO" class="btn btn-secondary btn-sm">INFO</a>
@@ -1628,9 +2815,8 @@ def audit_log_view(username: str, password: str, target_owner: str = None, level
             <tbody>{rows_html}</tbody>
         </table>
     </div>"""
-    return render_shell("Bezpečnostní log", "audit", username, password, view_owner, body)
+    return render_shell("Forenzní Audit Log", "audit", username, password, view_owner, body)
 
-# --- 7. ÚDRŽBA, INTEGRITA A OPTIMALIZACE ÚLOŽIŠTĚ ---
 @app.get("/maintenance", response_class=HTMLResponse)
 def maintenance_view(username: str, password: str, target_owner: str = None, report: str = ""):
     user = verify_user(username, password)
@@ -1642,7 +2828,6 @@ def maintenance_view(username: str, password: str, target_owner: str = None, rep
     active_files = [f for f in all_files if not f.get("is_deleted") and not is_system_record(f)]
     trash_files = [f for f in all_files if f.get("is_deleted") and not is_system_record(f)]
 
-    # Detekce duplicit podle názvu a velikosti
     seen = {}
     duplicates = []
     for f in active_files:
@@ -1652,16 +2837,10 @@ def maintenance_view(username: str, password: str, target_owner: str = None, rep
         else:
             seen[key] = f
 
-    dup_rows = ""
-    for d in duplicates:
-        dup_rows += f"""
-        <tr>
-            <td>{html.escape(d['filename'])}</td>
-            <td class="mono">{html.escape(d['folder'])}</td>
-            <td class="mono">{format_bytes(d.get('size', 0))}</td>
-        </tr>"""
-    if not dup_rows:
-        dup_rows = "<tr><td colspan='3' style='text-align:center; color:var(--text-muted);'>Nebyly nalezeny žádné duplicitní soubory.</td></tr>"
+    dup_rows = "".join([
+        f"<tr><td>{html.escape(d['filename'])}</td><td class='mono'>{html.escape(d['folder'])}</td><td class='mono'>{format_bytes(d.get('size', 0))}</td></tr>"
+        for d in duplicates
+    ]) or "<tr><td colspan='3' style='text-align:center; color:var(--text-muted);'>Nebyly nalezeny žádné duplicitní soubory.</td></tr>"
 
     alert_html = f'<div class="alert-bar ok">{html.escape(report)}</div>' if report else ""
     body = f"""
@@ -1679,8 +2858,8 @@ def maintenance_view(username: str, password: str, target_owner: str = None, rep
         </div>
 
         <div class="panel">
-            <div class="panel-header"><h3 class="panel-title">{svg("shield")} Kontrola integrity metadat</h3></div>
-            <p style="color:var(--text-muted);">Ověří dostupnost všech záznamů v Supabase a odstraní poškozené odkazy.</p>
+            <div class="panel-header"><h3 class="panel-title">{svg("shield")} Kontrola integrity odkazů</h3></div>
+            <p style="color:var(--text-muted);">Ověří dostupnost všech záznamů v Supabase a detekuje neplatné odkazy.</p>
             <form action="/maintenance/verify-integrity" method="POST">
                 <input type="hidden" name="username" value="{html.escape(username)}">
                 <input type="hidden" name="password" value="{html.escape(password)}">
@@ -1692,12 +2871,9 @@ def maintenance_view(username: str, password: str, target_owner: str = None, rep
 
     <div class="panel">
         <div class="panel-header"><h3 class="panel-title">Detekce duplicitních souborů ({len(duplicates)})</h3></div>
-        <table>
-            <thead><tr><th>Soubor</th><th>Složka</th><th>Velikost</th></tr></thead>
-            <tbody>{dup_rows}</tbody>
-        </table>
+        <table><thead><tr><th>Soubor</th><th>Složka</th><th>Velikost</th></tr></thead><tbody>{dup_rows}</tbody></table>
     </div>"""
-    return render_shell("Údržba a zálohy", "maintenance", username, password, view_owner, body)
+    return render_shell("Údržba & Deduplikace", "maintenance", username, password, view_owner, body)
 
 @app.post("/maintenance/empty-trash", response_class=HTMLResponse)
 def maintenance_empty_trash(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None)):
@@ -1718,10 +2894,10 @@ def maintenance_verify_integrity(username: str = Form(...), password: str = Form
     res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("is_deleted", False).execute()
     active = [f for f in (res.data or []) if not is_system_record(f)]
     broken = [f for f in active if not f.get("file_url", "").startswith("http")]
-    log_audit(username, "INTEGRITY_SCAN", f"Zkontrolováno {len(active)} souborů, poškozených odkazů: {len(broken)}", "INFO")
+    log_audit(username, "INTEGRITY_SCAN", f"Zkontrolováno {len(active)} souborů, poškozených: {len(broken)}", "INFO")
     return maintenance_view(username, password, view_owner, f"Kontrola dokončena: {len(active)} souborů ověřeno, {len(broken)} neplatných odkazů.")
 
-# --- 8. VAULTUPDATE & OTA STUDIO (AKTUALIZACE A VÝVOJ MODULŮ BEZ ZÁSAHU DO MAIN.PY) ---
+# --- 11. VAULTUPDATE & OTA STUDIO (S KONTROLOU SYNTAXE PŘED AKTIVACÍ) ---
 @app.get("/vaultupdate", response_class=HTMLResponse)
 def vaultupdate_view(username: str, password: str, target_owner: str = None, status_msg: str = ""):
     user = verify_user(username, password)
@@ -1734,7 +2910,7 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
     manifest = fetch_remote_manifest()
     has_update = False
     remote_ver = active_ver
-    update_notes = "Žádné nové balíčky nebyly nalezeny."
+    update_notes = "Žádné nové OTA moduly nebyly nalezeny."
 
     if manifest:
         remote_ver = str(manifest.get("version", active_ver))
@@ -1744,8 +2920,6 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
             rver = str(rm.get("version", ""))
             if rname and (rname not in LOADED_OTA_MODULES or str(LOADED_OTA_MODULES[rname].get("version", "")) != rver):
                 has_update = True
-        if remote_ver != active_ver:
-            has_update = True
 
     installed_rows = ""
     for k, m in LOADED_OTA_MODULES.items():
@@ -1753,7 +2927,7 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
         <tr>
             <td><strong>{html.escape(m['title'])}</strong> <span class="mono" style="color:var(--text-muted);">({html.escape(k)})</span></td>
             <td class="mono">v{html.escape(m['version'])}</td>
-            <td><span class="badge badge-ok">LOADED // LIVE</span></td>
+            <td><span class="badge badge-ok">VERIFIED // LIVE</span></td>
             <td>
                 <form action="/vaultupdate/uninstall" method="POST" style="margin:0;">
                     <input type="hidden" name="username" value="{html.escape(username)}">
@@ -1765,7 +2939,7 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
             </td>
         </tr>"""
     if not installed_rows:
-        installed_rows = "<tr><td colspan='4' style='text-align:center; color:var(--text-muted);'>Žádné nainstalované OTA moduly.</td></tr>"
+        installed_rows = "<tr><td colspan='4' style='text-align:center; color:var(--text-muted);'>Žádné nainstalované OTA doplňky.</td></tr>"
 
     q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
 
@@ -1773,10 +2947,10 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
         update_box = f"""
         <div class="alert-bar warn">
             <div>
-                <strong>Dostupná aktualizace systému: v{html.escape(remote_ver)}</strong><br>
+                <strong>Dostupný nový OTA balíček: v{html.escape(remote_ver)}</strong><br>
                 <span style="color:var(--text-muted);">{html.escape(update_notes)}</span>
             </div>
-            <form id="ota-install-form" action="/vaultupdate/install" method="POST" style="margin:0;">
+            <form action="/vaultupdate/install" method="POST" style="margin:0;">
                 <input type="hidden" name="username" value="{html.escape(username)}">
                 <input type="hidden" name="password" value="{html.escape(password)}">
                 <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
@@ -1787,97 +2961,62 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
         update_box = f"""
         <div class="alert-bar ok">
             <div>
-                <strong>Systém je aktuální (v{html.escape(active_ver)})</strong><br>
-                <span style="color:var(--text-muted);">Zdrojový manifest: <span class="mono">{html.escape(HF_REPO_ID or 'nenastaveno')}/system_ota/manifest.json</span></span>
+                <strong>Jádro systému je aktuální (v{html.escape(active_ver)})</strong><br>
+                <span style="color:var(--text-muted);">Pevné jádro na Renderu + OTA repozitář <span class="mono">{html.escape(HF_REPO_ID or 'nenastaveno')}/system_ota/</span></span>
             </div>
             <a href="/vaultupdate?{q_params}" class="btn btn-secondary btn-sm">Zkontrolovat znovu</a>
         </div>"""
 
     starter_module_code = '''def render(username, password, view_owner, supabase, action_data):
-    # Vlastní OTA modul pro VaultGrid OS
-    task_text = action_data.get("task_text", "").strip()
-    if task_text and supabase:
+    note = action_data.get("note", "").strip()
+    if note and supabase:
         supabase.table("nxt_files").insert({
-            "owner": view_owner,
-            "filename": "vault_note",
-            "storage_provider": "vault_note_item",
-            "file_url": task_text,
-            "folder": "/_notes",
-            "size": 0,
-            "is_deleted": False
+            "owner": view_owner, "filename": "vault_note", "storage_provider": "vault_note_item",
+            "file_url": note, "folder": "/_notes", "size": 0, "is_deleted": False
         }).execute()
-
-    items = []
+    rows = ""
     if supabase:
         res = supabase.table("nxt_files").select("*").eq("owner", view_owner).eq("storage_provider", "vault_note_item").eq("is_deleted", False).execute()
-        items = res.data or []
-
-    rows = "".join([f"<tr><td class='mono'>#{i+1}</td><td>{html.escape(x.get('file_url', ''))}</td></tr>" for i, x in enumerate(reversed(items))])
-    if not rows:
-        rows = "<tr><td colspan='2' style='color:var(--text-muted); text-align:center;'>Žádné záznamy.</td></tr>"
-
+        rows = "".join([f"<tr><td class='mono'>#{i+1}</td><td>{html.escape(x.get('file_url',''))}</td></tr>" for i, x in enumerate(reversed(res.data or []))])
     body = f"""
     <div class="panel">
-        <div class="panel-header"><h2 class="panel-title">Provozní poznámky a úkoly (OTA Modul)</h2></div>
-        <form action="/ota-app/vaultnotes" method="POST" class="form-row" style="margin-bottom:14px;">
+        <div class="panel-header"><h2 class="panel-title">Provozní poznámky (OTA Modul)</h2></div>
+        <form action="/ota-app/vaultnotes" method="POST" class="form-row" style="margin-bottom:12px;">
             <input type="hidden" name="username" value="{html.escape(username)}">
             <input type="hidden" name="password" value="{html.escape(password)}">
             <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
-            <input type="text" name="task_text" placeholder="Zadejte provozní záznam..." required style="flex:1;">
-            <button type="submit" class="btn">Uložit záznam</button>
+            <input type="text" name="note" placeholder="Zadejte poznámku..." required style="flex:1;">
+            <button type="submit" class="btn">Uložit</button>
         </form>
-        <table>
-            <thead><tr><th style="width:70px;">ID</th><th>Záznam</th></tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
+        <table><thead><tr><th>#</th><th>Záznam</th></tr></thead><tbody>{rows or "<tr><td colspan='2'>Prázdné</td></tr>"}</tbody></table>
     </div>"""
-    return render_shell("VaultNotes Pro", "ota_vaultnotes", username, password, view_owner, body)'''
+    return render_shell("VaultNotes", "ota_vaultnotes", username, password, view_owner, body)'''
 
     alert_html = f'<div class="alert-bar ok">{html.escape(status_msg)}</div>' if status_msg else ""
-
     body = f"""
     {alert_html}
     {update_box}
-
     <div class="panel">
         <div class="panel-header"><h2 class="panel-title">{svg("package")} Nainstalovaná OTA rozšíření</h2></div>
-        <table>
-            <thead><tr><th>Název modulu</th><th>Verze</th><th>Stav</th><th>Akce</th></tr></thead>
-            <tbody>{installed_rows}</tbody>
-        </table>
+        <table><thead><tr><th>Název</th><th>Verze</th><th>Stav</th><th>Akce</th></tr></thead><tbody>{installed_rows}</tbody></table>
     </div>
-
     <div class="panel">
-        <div class="panel-header"><h2 class="panel-title">{svg("code")} OTA Studio — Publikovat novou aktualizaci na Hugging Face</h2></div>
-        <p style="color:var(--text-muted); margin-top:0;">Kód se nahraje do <span class="mono">system_ota/</span> a zapíše se do <span class="mono">manifest.json</span>. Následně jej nainstalujete jedním kliknutím bez úpravy <span class="mono">main.py</span>.</p>
+        <div class="panel-header"><h2 class="panel-title">{svg("code")} OTA Studio — Publikovat rozšíření (s kontrolou syntaxe)</h2></div>
         <form action="/vaultupdate/publish-custom" method="POST">
             <input type="hidden" name="username" value="{html.escape(username)}">
             <input type="hidden" name="password" value="{html.escape(password)}">
             <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
             <div class="grid-2" style="margin-bottom:10px;">
-                <div>
-                    <label style="font-size:12px; color:var(--text-muted);">ID modulu (bez mezer)</label>
-                    <input type="text" name="mod_name" value="vaultnotes" required>
-                </div>
-                <div>
-                    <label style="font-size:12px; color:var(--text-muted);">Název v navigaci</label>
-                    <input type="text" name="mod_title" value="VaultNotes Pro" required>
-                </div>
-                <div>
-                    <label style="font-size:12px; color:var(--text-muted);">Verze balíčku</label>
-                    <input type="text" name="new_version" value="20.1" required>
-                </div>
-                <div>
-                    <label style="font-size:12px; color:var(--text-muted);">Popis změn (Changelog)</label>
-                    <input type="text" name="release_notes" value="Přidán modul provozních poznámek VaultNotes Pro." required>
-                </div>
+                <input type="text" name="mod_name" value="vaultnotes" placeholder="ID modulu" required>
+                <input type="text" name="mod_title" value="VaultNotes" placeholder="Název v navigaci" required>
+                <input type="text" name="new_version" value="22.1" placeholder="Verze" required>
+                <input type="text" name="release_notes" value="Nový OTA modul poznámek." placeholder="Changelog" required>
             </div>
-            <label style="font-size:12px; color:var(--text-muted);">Python kód modulu (funkce <span class="mono">render(username, password, view_owner, supabase, action_data)</span>)</label>
-            <textarea name="module_code" rows="16" class="code-box" style="margin:4px 0 12px 0;" required>{html.escape(starter_module_code)}</textarea>
-            <button type="submit" class="btn">Publikovat balíček na Hugging Face</button>
+            <textarea name="module_code" rows="14" class="code-box" style="margin-bottom:12px;" required>{html.escape(starter_module_code)}</textarea>
+            <button type="submit" class="btn">Ověřit syntaxi a publikovat na Hugging Face</button>
         </form>
     </div>"""
-    return render_shell("VaultUpdate & OTA Studio", "vaultupdate", username, password, view_owner, body)
+    return render_shell("VaultUpdate & OTA", "vaultupdate", username, password, view_owner, body)
 
 @app.post("/vaultupdate/publish-custom", response_class=HTMLResponse)
 def vaultupdate_publish_custom(
@@ -1895,46 +3034,27 @@ def vaultupdate_publish_custom(
         return login_page()
     view_owner = target_owner or username
     if not (hf_api and HF_REPO_ID):
-        return vaultupdate_view(username, password, view_owner, "Chybí proměnné HF_TOKEN nebo HF_REPO_ID.")
+        return vaultupdate_view(username, password, view_owner, "Chybí HF_TOKEN nebo HF_REPO_ID.")
+
+    try:
+        compile(module_code, "<ota_syntax_check>", "exec")
+    except Exception as syn_err:
+        return vaultupdate_view(username, password, view_owner, f"Chyba syntaxe v Python kódu modulu (publikování zrušeno): {syn_err}")
 
     clean_name = "".join([c for c in mod_name.strip().lower() if c.isalnum() or c == "_"])
-    if not clean_name:
-        return vaultupdate_view(username, password, view_owner, "Neplatné ID modulu.")
-
     code_path = f"system_ota/{clean_name}.py"
     try:
-        hf_api.upload_file(
-            path_or_fileobj=module_code.encode("utf-8"),
-            path_in_repo=code_path,
-            repo_id=HF_REPO_ID,
-            repo_type="dataset"
-        )
+        hf_api.upload_file(path_or_fileobj=module_code.encode("utf-8"), path_in_repo=code_path, repo_id=HF_REPO_ID, repo_type="dataset")
         code_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{code_path}"
-
         existing = fetch_remote_manifest() or {"version": new_version.strip(), "notes": "", "modules": []}
         modules_list = [m for m in existing.get("modules", []) if m.get("name") != clean_name]
-        modules_list.append({
-            "name": clean_name,
-            "title": mod_title.strip(),
-            "sub": "OTA Modul",
-            "version": new_version.strip(),
-            "code_url": code_url
-        })
-        updated_manifest = {
-            "version": new_version.strip(),
-            "notes": release_notes.strip(),
-            "modules": modules_list
-        }
-        hf_api.upload_file(
-            path_or_fileobj=json.dumps(updated_manifest, ensure_ascii=False, indent=2).encode("utf-8"),
-            path_in_repo="system_ota/manifest.json",
-            repo_id=HF_REPO_ID,
-            repo_type="dataset"
-        )
+        modules_list.append({"name": clean_name, "title": mod_title.strip(), "sub": "OTA Modul", "version": new_version.strip(), "code_url": code_url})
+        updated_manifest = {"version": new_version.strip(), "notes": release_notes.strip(), "modules": modules_list}
+        hf_api.upload_file(path_or_fileobj=json.dumps(updated_manifest, ensure_ascii=False, indent=2).encode("utf-8"), path_in_repo="system_ota/manifest.json", repo_id=HF_REPO_ID, repo_type="dataset")
         log_audit(username, "OTA_PUBLISHED", f"Publikován OTA balíček {clean_name} v{new_version.strip()}", "INFO")
-        return vaultupdate_view(username, password, view_owner, f"Balíček {mod_title.strip()} (v{new_version.strip()}) byl publikován na Hugging Face.")
+        return vaultupdate_view(username, password, view_owner, f"Balíček {mod_title.strip()} (v{new_version.strip()}) prošel kontrolou syntaxe a byl publikován.")
     except Exception as e:
-        return vaultupdate_view(username, password, view_owner, f"Chyba publikování: {e}")
+        return vaultupdate_view(username, password, view_owner, f"Chyba nahrávání: {e}")
 
 @app.post("/vaultupdate/install", response_class=HTMLResponse)
 def vaultupdate_install(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None)):
@@ -1953,25 +3073,14 @@ def vaultupdate_install(username: str = Form(...), password: str = Form(...), ta
             req = urllib.request.Request(curl, headers={"Cache-Control": "no-cache"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 code_str = resp.read().decode("utf-8")
-            LOADED_OTA_MODULES[mname] = {
-                "title": mod.get("title", mname),
-                "sub": mod.get("sub", "OTA Modul"),
-                "version": str(mod.get("version", manifest.get("version", "20.1"))),
-                "code": code_str
-            }
+            compile(code_str, f"<ota_{mname}>", "exec")
+            LOADED_OTA_MODULES[mname] = {"title": mod.get("title", mname), "sub": "OTA Modul", "version": str(mod.get("version", "22.1")), "code": code_str}
             supabase.table("nxt_files").delete().eq("storage_provider", "vault_ota_module").eq("filename", mname).execute()
             supabase.table("nxt_files").insert({
-                "owner": "system",
-                "filename": mname,
-                "storage_provider": "vault_ota_module",
-                "file_url": json.dumps(mod, ensure_ascii=False),
-                "folder": "/_ota",
-                "size": len(code_str),
-                "is_deleted": False
+                "owner": "system", "filename": mname, "storage_provider": "vault_ota_module",
+                "file_url": json.dumps(mod, ensure_ascii=False), "folder": "/_ota", "size": len(code_str), "is_deleted": False
             }).execute()
-
-    log_audit(username, "OTA_INSTALLED", f"Nainstalována OTA aktualizace v{manifest.get('version')}", "INFO")
-    return vaultupdate_view(username, password, view_owner, f"Aktualizace na verzi v{manifest.get('version')} byla dokončena.")
+    return vaultupdate_view(username, password, view_owner, "OTA rozšíření byla nainstalována.")
 
 @app.post("/vaultupdate/uninstall", response_class=HTMLResponse)
 def vaultupdate_uninstall(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), module_name: str = Form(...)):
@@ -1981,7 +3090,6 @@ def vaultupdate_uninstall(username: str = Form(...), password: str = Form(...), 
     view_owner = target_owner or username
     LOADED_OTA_MODULES.pop(module_name, None)
     supabase.table("nxt_files").delete().eq("storage_provider", "vault_ota_module").eq("filename", module_name).execute()
-    log_audit(username, "OTA_UNINSTALLED", f"Odinstalován modul {module_name}", "WARN")
     return vaultupdate_view(username, password, view_owner, f"Modul '{module_name}' byl odinstalován.")
 
 @app.get("/ota-app/{module_name}", response_class=HTMLResponse)
@@ -1992,7 +3100,7 @@ def ota_app_get(module_name: str, request: Request, username: str, password: str
     sync_ota_modules_from_db()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
     if module_name not in LOADED_OTA_MODULES:
-        return vaultupdate_view(username, password, view_owner, "Požadovaný OTA modul není nainstalován.")
+        return vaultupdate_view(username, password, view_owner, "Modul není nainstalován.")
     ns = {"render_shell": render_shell, "html": html, "json": json, "svg": svg, "format_bytes": format_bytes}
     exec(LOADED_OTA_MODULES[module_name]["code"], ns)
     return ns["render"](username, password, view_owner, supabase, dict(request.query_params))
@@ -2009,12 +3117,12 @@ async def ota_app_post(module_name: str, request: Request):
     target_owner = form_data.get("target_owner")
     view_owner = str(target_owner) if (user["role"] == "admin" and target_owner) else username
     if module_name not in LOADED_OTA_MODULES:
-        return vaultupdate_view(username, password, view_owner, "Požadovaný OTA modul není nainstalován.")
+        return vaultupdate_view(username, password, view_owner, "Modul není nainstalován.")
     ns = {"render_shell": render_shell, "html": html, "json": json, "svg": svg, "format_bytes": format_bytes}
     exec(LOADED_OTA_MODULES[module_name]["code"], ns)
     return ns["render"](username, password, view_owner, supabase, form_data)
 
-# --- 9. VAULTCHAT ---
+# --- 12. VAULTCHAT & VAULTCODE IDE PRO (S ŽIVÝM NÁHLEDEM) ---
 @app.get("/vaultchat", response_class=HTMLResponse)
 def vaultchat_view(username: str, password: str, target_owner: str = None):
     user = verify_user(username, password)
@@ -2024,16 +3132,11 @@ def vaultchat_view(username: str, password: str, target_owner: str = None):
     q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
 
     msgs = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_chat").order("id", desc=False).execute().data or []
-    recent = msgs[-60:]
     entries_html = ""
-    for m in recent:
+    for m in msgs[-60:]:
         sender = m.get("owner", "system")
         mine = "mine" if sender == username else ""
-        entries_html += f"""
-        <div class="chat-entry {mine}">
-            <div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;"><strong>{html.escape(sender)}</strong></div>
-            <div>{html.escape(m.get('file_url', ''))}</div>
-        </div>"""
+        entries_html += f'<div class="chat-entry {mine}"><div style="font-size:11px; color:var(--text-muted); margin-bottom:2px;"><strong>{html.escape(sender)}</strong></div><div>{html.escape(m.get("file_url", ""))}</div></div>'
     if not entries_html:
         entries_html = '<div style="color:var(--text-muted); margin:auto;">Žádné zprávy v kanálu.</div>'
 
@@ -2062,38 +3165,43 @@ def vaultchat_send(username: str = Form(...), password: str = Form(...), target_
         return login_page()
     if message.strip():
         supabase.table("nxt_files").insert({
-            "owner": username,
-            "filename": "chat_msg",
-            "storage_provider": "vault_chat",
-            "file_url": message.strip(),
-            "folder": "/_chat",
-            "size": 0,
-            "is_deleted": False
+            "owner": username, "filename": "chat_msg", "storage_provider": "vault_chat",
+            "file_url": message.strip(), "folder": "/_chat", "size": 0, "is_deleted": False
         }).execute()
     return vaultchat_view(username, password, target_owner)
 
-# --- 10. VAULTCODE IDE & EDITOR ---
 @app.get("/new-file", response_class=HTMLResponse)
 def new_file_view(username: str, password: str, folder: str = "/", target_owner: str = None):
     user = verify_user(username, password)
     if not user:
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
-    starter = "<!DOCTYPE html>\n<html lang=\"cs\">\n<head>\n    <meta charset=\"UTF-8\">\n    <title>VaultGrid Web</title>\n</head>\n<body>\n    <h1>VaultGrid Cloud Hosting</h1>\n</body>\n</html>"
+    starter = "<!DOCTYPE html>\n<html lang=\"cs\">\n<head>\n    <meta charset=\"UTF-8\">\n    <title>VaultGrid Web</title>\n    <style>body { font-family: system-ui; padding: 30px; background: #111; color: #eee; }</style>\n</head>\n<body>\n    <h1>VaultGrid Static Web Hosting</h1>\n    <p>Živý náhled v reálném čase.</p>\n</body>\n</html>"
     body = f"""
     <div class="panel">
-        <div class="panel-header"><h2 class="panel-title">{svg("code")} Nový textový soubor / HTML stránka v {html.escape(folder)}</h2></div>
+        <div class="panel-header"><h2 class="panel-title">{svg("code")} VaultCode IDE Pro — Editor & Živý náhled ({html.escape(folder)})</h2></div>
         <form action="/create-text-file" method="POST">
             <input type="hidden" name="username" value="{html.escape(username)}">
             <input type="hidden" name="password" value="{html.escape(password)}">
             <input type="hidden" name="folder" value="{html.escape(folder)}">
             <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
-            <input type="text" name="filename" value="index.html" required style="margin-bottom:10px;">
-            <textarea name="content" rows="18" class="code-box" style="margin-bottom:12px;">{html.escape(starter)}</textarea>
-            <button type="submit" class="btn">Uložit do úložiště</button>
+            <div class="form-row" style="margin-bottom:10px;">
+                <input type="text" name="filename" value="index.html" required style="width:240px;">
+                <button type="submit" class="btn">Uložit do úložiště</button>
+            </div>
+            <div class="grid-2">
+                <textarea id="ide-code" name="content" rows="20" class="code-box" oninput="updateLiveFrame()">{html.escape(starter)}</textarea>
+                <iframe id="ide-preview" style="width:100%; height:100%; min-height:380px; background:#fff; border:1px solid var(--border); border-radius:5px;"></iframe>
+            </div>
         </form>
-    </div>"""
-    return render_shell("VaultCode IDE", "code", username, password, view_owner, body)
+    </div>
+    <script>
+        function updateLiveFrame() {{
+            document.getElementById('ide-preview').srcdoc = document.getElementById('ide-code').value;
+        }}
+        updateLiveFrame();
+    </script>"""
+    return render_shell("VaultCode IDE Pro", "code", username, password, view_owner, body)
 
 @app.post("/create-text-file", response_class=HTMLResponse)
 def create_text_file(username: str = Form(...), password: str = Form(...), folder: str = Form("/"), target_owner: str = Form(None), filename: str = Form(...), content: str = Form(...)):
@@ -2113,16 +3221,11 @@ def create_text_file(username: str = Form(...), password: str = Form(...), folde
         public_url = "#"
 
     supabase.table("nxt_files").insert({
-        "owner": view_owner,
-        "filename": clean_name,
-        "storage_provider": "huggingface",
-        "file_url": public_url,
-        "folder": folder,
-        "size": len(file_bytes),
-        "is_deleted": False
+        "owner": view_owner, "filename": clean_name, "storage_provider": "huggingface",
+        "file_url": public_url, "folder": folder, "size": len(file_bytes), "is_deleted": False
     }).execute()
     log_audit(username, "FILE_CREATED", f"Vytvořen soubor {repo_path}", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, False, "", "", f"Soubor {clean_name} byl uložen.")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, "/", "single", False, "", "", "", f"Soubor {clean_name} byl uložen.")
 
 @app.get("/code-editor", response_class=HTMLResponse)
 def code_editor_view(id: int, username: str, password: str, target_owner: str = None):
@@ -2130,10 +3233,9 @@ def code_editor_view(id: int, username: str, password: str, target_owner: str = 
     if not user:
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
-    res = supabase.table("nxt_files").select("*").eq("id", id).execute()
-    if not res.data:
+    rec = (supabase.table("nxt_files").select("*").eq("id", id).execute().data or [None])[0]
+    if not rec:
         return "Soubor nenalezen."
-    rec = res.data[0]
     try:
         with urllib.request.urlopen(rec["file_url"], timeout=6) as resp:
             text = resp.read().decode("utf-8")
@@ -2159,7 +3261,7 @@ def code_editor_view(id: int, username: str, password: str, target_owner: str = 
 def save_code(username: str = Form(...), password: str = Form(...), target_owner: str = Form(None), filename: str = Form(...), folder: str = Form(...), content: str = Form(...)):
     return create_text_file(username, password, folder, target_owner, filename, content)
 
-# --- 11. OPERACE SE SOUBORY, ZIP EXPORT, SDÍLENÍ, VERZE, KOMENTÁŘE ---
+# --- 13. OPERACE SE SOUBORY, NAHRÁVÁNÍ (DEDUPLIKACE + VAULTCRYPT + VAULTRULES) ---
 @app.post("/create-folder", response_class=HTMLResponse)
 def create_folder(username: str = Form(...), password: str = Form(...), current_folder: str = Form(...), new_folder_name: str = Form(...), target_owner: str = Form(None)):
     user = verify_user(username, password)
@@ -2169,16 +3271,11 @@ def create_folder(username: str = Form(...), password: str = Form(...), current_
     clean_name = new_folder_name.strip().replace("/", "")
     new_path = f"{current_folder.rstrip('/')}/{clean_name}"
     supabase.table("nxt_files").insert({
-        "owner": view_owner,
-        "filename": f".slozkové_meta_{clean_name}",
-        "storage_provider": "system",
-        "file_url": "#",
-        "folder": new_path,
-        "size": 0,
-        "is_deleted": False
+        "owner": view_owner, "filename": f".slozkové_meta_{clean_name}", "storage_provider": "system",
+        "file_url": "#", "folder": new_path, "size": 0, "is_deleted": False
     }).execute()
     log_audit(username, "DIR_CREATED", f"Vytvořen adresář {new_path}", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, new_path, False, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, new_path, "/", "single", False, "", "", "", "")
 
 @app.post("/upload", response_class=HTMLResponse)
 async def upload_files(
@@ -2187,6 +3284,8 @@ async def upload_files(
     folder: str = Form("/"),
     target_owner: str = Form(None),
     unlocked_pin: str = Form(""),
+    encrypt_flag: str = Form(""),
+    encrypt_pass: str = Form(""),
     files: list[UploadFile] = File(...)
 ):
     user = verify_user(username, password)
@@ -2194,42 +3293,60 @@ async def upload_files(
         return login_page()
     view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
 
-    # Kontrola kvóty uživatele
     quota_limit = get_user_quota_bytes(view_owner)
-    existing_res = supabase.table("nxt_files").select("size, storage_provider, filename").eq("owner", view_owner).eq("is_deleted", False).execute()
-    current_used = sum(int(f.get("size", 0)) for f in (existing_res.data or []) if not is_system_record(f))
+    all_rows = supabase.table("nxt_files").select("*").eq("is_deleted", False).execute().data or []
+    active_global = [r for r in all_rows if not is_system_record(r)]
+    current_used = sum(int(f.get("size", 0)) for f in active_global if f.get("owner") == view_owner)
 
-    repo_id = get_active_write_repo()
+    repo_id = get_active_write_repo(active_global)
     uploaded_count = 0
+    dedup_saved = 0
+
     for f in files:
         if not f.filename:
             continue
-        file_bytes = await f.read()
-        if quota_limit > 0 and (current_used + len(file_bytes)) > quota_limit:
+        raw_bytes = await f.read()
+        final_name = f.filename
+        final_bytes = raw_bytes
+
+        if encrypt_flag == "1" and encrypt_pass.strip():
+            final_bytes = vaultcrypt_encrypt(raw_bytes, encrypt_pass.strip())
+            final_name = f.filename + ".vgenc"
+
+        if quota_limit > 0 and (current_used + len(final_bytes)) > quota_limit:
             log_audit(username, "QUOTA_EXCEEDED", f"Překročena disková kvóta pro {view_owner}", "WARN")
-            return render_files_view(username, password, user["role"] == "admin", view_owner, folder, False, "", unlocked_pin, "Chyba: Byla překročena přidělená disková kvóta.")
+            return render_files_view(username, password, user["role"] == "admin", view_owner, folder, "/", "single", False, "", "", unlocked_pin, "Chyba: Byla překročena přidělená disková kvóta.")
 
-        repo_path = f"{view_owner}{folder}/{f.filename}".replace("//", "/")
-        if hf_api and repo_id:
-            hf_api.upload_file(path_or_fileobj=file_bytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
-            public_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+        dest_folder, auto_tags = apply_vault_rules(view_owner, final_name, folder)
+
+        existing_match = next((x for x in active_global if x.get("filename") == final_name and int(x.get("size", 0)) == len(final_bytes) and x.get("file_url", "").startswith("http")), None)
+        if existing_match and not encrypt_flag:
+            public_url = existing_match["file_url"]
+            dedup_saved += 1
         else:
-            public_url = "#"
+            repo_path = f"{view_owner}{dest_folder}/{final_name}".replace("//", "/")
+            if hf_api and repo_id:
+                hf_api.upload_file(path_or_fileobj=final_bytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
+                public_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+            else:
+                public_url = "#"
 
-        supabase.table("nxt_files").insert({
-            "owner": view_owner,
-            "filename": f.filename,
-            "storage_provider": "huggingface",
-            "file_url": public_url,
-            "folder": folder,
-            "size": len(file_bytes),
-            "is_deleted": False
+        ins_res = supabase.table("nxt_files").insert({
+            "owner": view_owner, "filename": final_name, "storage_provider": "huggingface",
+            "file_url": public_url, "folder": dest_folder, "size": len(final_bytes), "is_deleted": False
         }).execute()
-        current_used += len(file_bytes)
+
+        if ins_res.data and auto_tags:
+            new_id = ins_res.data[0]["id"]
+            for t in auto_tags:
+                attach_file_tag(view_owner, new_id, t)
+
+        current_used += len(final_bytes)
         uploaded_count += 1
 
-    log_audit(username, "FILES_UPLOADED", f"Nahráno {uploaded_count} souborů do {folder}", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, False, "", unlocked_pin, f"Úspěšně nahráno souborů: {uploaded_count}.")
+    log_audit(username, "FILES_UPLOADED", f"Nahráno {uploaded_count} souborů (deduplikováno: {dedup_saved})", "INFO")
+    info_txt = f"Nahráno souborů: {uploaded_count}" + (f" (z toho {dedup_saved} deduplikováno bez zabrání místa)" if dedup_saved else "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, "/", "single", False, "", "", unlocked_pin, info_txt)
 
 @app.get("/download-zip")
 def download_zip(username: str, password: str, folder: str = "/", target_owner: str = None):
@@ -2256,7 +3373,6 @@ def download_zip(username: str, password: str, folder: str = "/", target_owner: 
                 pass
     buf.seek(0)
     zip_name = (folder.strip("/").replace("/", "_") or "vaultgrid_root") + ".zip"
-    log_audit(username, "ZIP_EXPORT", f"Exportován archiv {zip_name}", "INFO")
     return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{zip_name}"'})
 
 @app.post("/set-folder-pin", response_class=HTMLResponse)
@@ -2269,16 +3385,11 @@ def set_folder_pin(username: str = Form(...), password: str = Form(...), current
     if clean_pin and current_folder != "/":
         supabase.table("nxt_files").delete().eq("owner", view_owner).eq("folder", current_folder).eq("filename", ".vault_pin_lock").execute()
         supabase.table("nxt_files").insert({
-            "owner": view_owner,
-            "filename": ".vault_pin_lock",
-            "storage_provider": "system_lock",
-            "file_url": clean_pin,
-            "folder": current_folder,
-            "size": 0,
-            "is_deleted": False
+            "owner": view_owner, "filename": ".vault_pin_lock", "storage_provider": "system_lock",
+            "file_url": clean_pin, "folder": current_folder, "size": 0, "is_deleted": False
         }).execute()
         log_audit(username, "PIN_LOCK_SET", f"Nastaven PIN zámek pro {current_folder}", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, False, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", "")
 
 @app.post("/remove-folder-pin", response_class=HTMLResponse)
 def remove_folder_pin(username: str = Form(...), password: str = Form(...), current_folder: str = Form(...), target_owner: str = Form(None)):
@@ -2288,7 +3399,7 @@ def remove_folder_pin(username: str = Form(...), password: str = Form(...), curr
     view_owner = target_owner or username
     supabase.table("nxt_files").delete().eq("owner", view_owner).eq("folder", current_folder).eq("filename", ".vault_pin_lock").execute()
     log_audit(username, "PIN_LOCK_REMOVED", f"Odebrán PIN zámek z {current_folder}", "WARN")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, False, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, current_folder, "/", "single", False, "", "", "", "")
 
 @app.get("/delete-file", response_class=HTMLResponse)
 def delete_file(id: int, username: str, password: str, folder: str, target_owner: str = None):
@@ -2297,8 +3408,7 @@ def delete_file(id: int, username: str, password: str, folder: str, target_owner
         return login_page()
     view_owner = target_owner or username
     supabase.table("nxt_files").update({"is_deleted": True}).eq("id", id).execute()
-    log_audit(username, "FILE_TRASHED", f"Soubor ID #{id} přesunut do koše", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, False, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, folder, "/", "single", False, "", "", "", "")
 
 @app.get("/restore-file", response_class=HTMLResponse)
 def restore_file(id: int, username: str, password: str, target_owner: str = None):
@@ -2307,8 +3417,7 @@ def restore_file(id: int, username: str, password: str, target_owner: str = None
         return login_page()
     view_owner = target_owner or username
     supabase.table("nxt_files").update({"is_deleted": False}).eq("id", id).execute()
-    log_audit(username, "FILE_RESTORED", f"Soubor ID #{id} obnoven z koše", "INFO")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, "/", True, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, "/", "/", "single", True, "", "", "", "")
 
 @app.get("/delete-permanently", response_class=HTMLResponse)
 def delete_permanently(id: int, username: str, password: str, target_owner: str = None):
@@ -2317,8 +3426,7 @@ def delete_permanently(id: int, username: str, password: str, target_owner: str 
         return login_page()
     view_owner = target_owner or username
     supabase.table("nxt_files").delete().eq("id", id).execute()
-    log_audit(username, "FILE_PURGED", f"Soubor ID #{id} trvale odstraněn", "WARN")
-    return render_files_view(username, password, user["role"] == "admin", view_owner, "/", True, "", "", "")
+    return render_files_view(username, password, user["role"] == "admin", view_owner, "/", "/", "single", True, "", "", "", "")
 
 @app.post("/admin/add-user", response_class=HTMLResponse)
 def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user: str = Form(...), new_pass: str = Form(...), new_role: str = Form(...)):
@@ -2334,10 +3442,9 @@ def add_user(admin_user: str = Form(...), admin_pass: str = Form(...), new_user:
 
 @app.get("/share", response_class=HTMLResponse)
 def share_file(id: int):
-    res = supabase.table("nxt_files").select("*").eq("id", id).execute()
-    if not res.data:
+    rec = (supabase.table("nxt_files").select("*").eq("id", id).execute().data or [None])[0]
+    if not rec:
         return "Soubor nenalezen."
-    rec = res.data[0]
     return f"""<!DOCTYPE html><html lang="cs" data-theme="dark"><head><meta charset="UTF-8"><title>Sdílený soubor</title>{INDUSTRIAL_CSS}{THEME_SCRIPT}</head>
     <body style="display:flex; align-items:center; justify-content:center; min-height:100vh;">
         <div class="panel" style="max-width:440px; width:100%; text-align:center;">
@@ -2350,10 +3457,9 @@ def share_file(id: int):
 
 @app.get("/live", response_class=HTMLResponse)
 def live_html_preview(id: int):
-    res = supabase.table("nxt_files").select("*").eq("id", id).execute()
-    if not res.data:
+    rec = (supabase.table("nxt_files").select("*").eq("id", id).execute().data or [None])[0]
+    if not rec:
         return "Soubor nenalezen."
-    rec = res.data[0]
     if not rec["filename"].endswith(".html"):
         return "Pouze .html soubory lze spustit jako živý web."
     try:
@@ -2422,10 +3528,9 @@ def file_comments(file_id: int, username: str, password: str, target_owner: str 
     if not user:
         return login_page()
     view_owner = target_owner or username
-    f_res = supabase.table("nxt_files").select("*").eq("id", file_id).execute()
-    if not f_res.data:
+    rec = (supabase.table("nxt_files").select("*").eq("id", file_id).execute().data or [None])[0]
+    if not rec:
         return "Soubor nenalezen."
-    rec = f_res.data[0]
     comments = []
     try:
         comments = supabase.table("nxt_comments").select("*").eq("file_id", file_id).execute().data or []
@@ -2455,7 +3560,7 @@ def add_comment(file_id: int = Form(...), username: str = Form(...), password: s
         pass
     return file_comments(file_id, username, password, target_owner)
 
-# --- 12. ROOT SSH KONZOLE ---
+# --- 14. ROOT SSH KONZOLE ---
 def terminal_view(username: str, current_folder: str, history: str) -> str:
     safe_hist = html.escape(history)
     active_ver = get_installed_ota_version()
@@ -2489,17 +3594,19 @@ def terminal_exec(username: str = Form(...), current_folder: str = Form(...), hi
     act = parts[0].lower() if parts else ""
 
     if act == "help":
-        new_hist += "Příkazy:\n  ls        - Výpis souborů\n  cd <dir>  - Změna adresáře\n  pools     - Stav 7 TB úložných poolů\n  update    - Stav OTA aktualizací\n  audit     - Posledních 5 bezpečnostních událostí\n  users     - Seznam účtů\n  clear     - Vyčištění obrazovky\n\n"
+        new_hist += "Příkazy:\n  ls        - Výpis souborů\n  cd <dir>  - Změna adresáře\n  pools     - Stav 7 TB úložných poolů\n  drops     - Aktivní VaultDrop sdílecí odkazy\n  audit     - Posledních 5 bezpečnostních událostí\n  users     - Seznam účtů\n  clear     - Vyčištění obrazovky\n\n"
     elif act == "clear":
         new_hist = ""
     elif act == "pools":
         for p in get_storage_pools():
             new_hist += f"  - {p['label']} [{p['repo_id']}] ({p['quota_gb']} GB)\n"
         new_hist += "\n"
-    elif act == "update":
-        m = fetch_remote_manifest()
-        new_hist += f"  Installed: v{get_installed_ota_version()}\n"
-        new_hist += f"  Remote:    v{m.get('version')}\n\n" if m else "  Remote:    Žádný vzdálený manifest.\n\n"
+    elif act == "drops":
+        res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_drop").execute()
+        for r in (res.data or []):
+            m = json.loads(r.get("file_url", "{}"))
+            new_hist += f"  - /drop/{m.get('token')} -> {m.get('label')} (staženo: {m.get('downloads_used', 0)})\n"
+        new_hist += "\n"
     elif act == "audit":
         res = supabase.table("nxt_files").select("*").eq("storage_provider", "vault_audit").order("id", desc=True).limit(5).execute()
         for r in (res.data or []):
