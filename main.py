@@ -1,9 +1,11 @@
 import os
 import io
 import re
+import time
 import hmac
 import json
 import html
+import base64
 import zipfile
 import hashlib
 import secrets
@@ -11,15 +13,16 @@ import platform
 import mimetypes
 import urllib.request
 import urllib.parse
+from email.utils import formatdate
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Form, UploadFile, File, Request, Header
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
 from supabase import create_client, Client
 from huggingface_hub import HfApi
 
-app = FastAPI(title="VaultGrid OS Ultimate", version="22.0")
+app = FastAPI(title="VaultGrid OS Enterprise OMV", version="23.0")
 
-CORE_VERSION = "22.0"
+CORE_VERSION = "23.0-OMV"
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -53,6 +56,7 @@ SYSTEM_PROVIDERS = {
     "vault_api_token",
     "vault_watch_progress",
     "vault_file_tag",
+    "vault_leecher_log",
 }
 
 # --- VEKTOROVÉ SVG IKONY (LUCIDE INDUSTRIAL SET) ---
@@ -80,6 +84,8 @@ SVG_ICONS = {
     "key": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
     "eye": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
     "columns": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',
+    "harddrive": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>',
+    "download_cloud": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/></svg>',
 }
 
 def svg(name: str) -> str:
@@ -614,7 +620,6 @@ def get_active_write_repo(active_files: list[dict] | None = None) -> str:
         rows = supabase.table("nxt_files").select("file_url, size, is_deleted, storage_provider, filename").eq("is_deleted", False).execute().data or []
         active_files = [r for r in rows if not is_system_record(r)]
 
-    # Nejprve zkus preferovaný zápisový pool, pokud je pod 90 % kapacity
     ordered = sorted(pools, key=lambda x: 0 if x.get("is_active_write") else 1)
     for p in ordered:
         repo = p["repo_id"]
@@ -709,7 +714,7 @@ def sync_ota_modules_from_db():
                     LOADED_OTA_MODULES[mod_name] = {
                         "title": meta.get("title", mod_name),
                         "sub": meta.get("sub", "OTA Modul"),
-                        "version": str(meta.get("version", "22.1")),
+                        "version": str(meta.get("version", "23.1")),
                         "code": code_str
                     }
             except Exception:
@@ -783,6 +788,10 @@ def render_shell(
         {nav_link("pools", f"/storage-pools?{q_params}", "database", "Storage Pools (7 TB)")}
         {nav_link("audit", f"/audit-log?{q_params}", "shield", "Forenzní Audit Log")}
 
+        <div class="nav-group-label">Síť a Přenosy (OMV)</div>
+        {nav_link("webdav", f"/webdav-manager?{q_params}", "harddrive", "WebDAV Síťový disk")}
+        {nav_link("leecher", f"/url-leecher?{q_params}", "download_cloud", "URL Cloud Stahovač")}
+
         <div class="nav-group-label">Úložiště a Média</div>
         {nav_link("files", f"/files?{q_params}", "folder", "Správce souborů")}
         {nav_link("vaultflix", f"/vaultflix?{q_params}", "film", "VaultFlix Cinema")}
@@ -839,7 +848,7 @@ def render_shell(
                         <input type="text" name="q" value="{html.escape(search_query)}" placeholder="Hledat soubory nebo #štítek..." style="width: 230px;">
                         <button type="submit" class="btn btn-secondary btn-sm">Hledat</button>
                     </form>
-                    <span class="badge badge-ok">ULTIMATE OS // ONLINE</span>
+                    <span class="badge badge-ok">OMV ENTERPRISE // ONLINE</span>
                 </div>
             </header>
             <main class="content-wrap">
@@ -857,6 +866,703 @@ def verify_user(username: str, password: str) -> dict | None:
     if res.data and res.data[0].get("password") == password:
         return res.data[0]
     return None
+
+# --- NATIVNÍ WEBDAV SERVER ENGINE (RFC 4918 — PŘIPOJENÍ SÍŤOVÉHO DISKU Z:\) ---
+def _webdav_unauthorized() -> Response:
+    return Response(
+        content="401 Unauthorized — VaultGrid WebDAV NAS",
+        status_code=401,
+        headers={
+            "WWW-Authenticate": 'Basic realm="VaultGrid WebDAV NAS"',
+            "DAV": "1, 2",
+            "MS-Author-Via": "DAV",
+        },
+    )
+
+def _webdav_auth(request: Request, target_owner: str) -> tuple[bool, str]:
+    auth_hdr = request.headers.get("Authorization", "")
+    if not auth_hdr.startswith("Basic "):
+        return False, ""
+    try:
+        decoded = base64.b64decode(auth_hdr[6:].strip()).decode("utf-8")
+        if ":" not in decoded:
+            return False, ""
+        auth_user, auth_pass = decoded.split(":", 1)
+    except Exception:
+        return False, ""
+
+    user = verify_user(auth_user, auth_pass)
+    if not user:
+        return False, ""
+    if auth_user == target_owner or user.get("role") == "admin":
+        return True, auth_user
+    return False, ""
+
+def _webdav_encode_href(owner: str, virtual_path: str, is_dir: bool = False) -> str:
+    clean = "/" + virtual_path.strip("/") if virtual_path.strip("/") else ""
+    full = f"/webdav/{owner}{clean}"
+    if is_dir and not full.endswith("/"):
+        full += "/"
+    parts = [urllib.parse.quote(seg) for seg in full.split("/")]
+    return "/".join(parts)
+
+def _webdav_propfind_xml(owner: str, virtual_path: str, depth: str, items: list[dict]) -> str | None:
+    norm_path = "/" + virtual_path.strip("/") if virtual_path.strip("/") else "/"
+    http_date = formatdate(usegmt=True)
+
+    # Zjištění, zda norm_path je kořen, adresář nebo konkrétní soubor
+    dir_name = os.path.dirname(norm_path) or "/"
+    base_name = os.path.basename(norm_path)
+
+    matched_file = None
+    if norm_path != "/":
+        for f in items:
+            if not is_system_record(f) and f.get("folder", "/") == dir_name and f.get("filename") == base_name:
+                matched_file = f
+                break
+
+    responses = []
+
+    if matched_file:
+        href = _webdav_encode_href(owner, norm_path, is_dir=False)
+        mime, _ = mimetypes.guess_type(matched_file["filename"])
+        mime = mime or "application/octet-stream"
+        sz = int(matched_file.get("size", 0))
+        responses.append(f"""
+        <D:response>
+            <D:href>{href}</D:href>
+            <D:propstat>
+                <D:prop>
+                    <D:displayname>{html.escape(matched_file['filename'])}</D:displayname>
+                    <D:resourcetype/>
+                    <D:getcontentlength>{sz}</D:getcontentlength>
+                    <D:getcontenttype>{html.escape(mime)}</D:getcontenttype>
+                    <D:getlastmodified>{http_date}</D:getlastmodified>
+                </D:prop>
+                <D:status>HTTP/1.1 200 OK</D:status>
+            </D:propstat>
+        </D:response>""")
+    else:
+        # Kontrola, zda složka existuje (kořen existuje vždy)
+        folder_exists = (norm_path == "/")
+        subfolders = set()
+        direct_files = []
+
+        for f in items:
+            if f.get("storage_provider") in SYSTEM_PROVIDERS:
+                continue
+            item_fld = f.get("folder", "/")
+            if item_fld == norm_path or item_fld.startswith(norm_path.rstrip("/") + "/"):
+                folder_exists = True
+            if item_fld.startswith(norm_path) and item_fld != norm_path:
+                rel = item_fld[len(norm_path):].strip("/")
+                if rel:
+                    sub_name = rel.split("/")[0]
+                    subfolders.add(f"{norm_path.rstrip('/')}/{sub_name}")
+            if item_fld == norm_path and not is_system_record(f):
+                direct_files.append(f)
+
+        if not folder_exists:
+            return None
+
+        root_href = _webdav_encode_href(owner, norm_path, is_dir=True)
+        disp = owner if norm_path == "/" else os.path.basename(norm_path)
+        responses.append(f"""
+        <D:response>
+            <D:href>{root_href}</D:href>
+            <D:propstat>
+                <D:prop>
+                    <D:displayname>{html.escape(disp)}</D:displayname>
+                    <D:resourcetype><D:collection/></D:resourcetype>
+                    <D:getlastmodified>{http_date}</D:getlastmodified>
+                </D:prop>
+                <D:status>HTTP/1.1 200 OK</D:status>
+            </D:propstat>
+        </D:response>""")
+
+        if depth != "0":
+            for sf in sorted(subfolders):
+                sf_href = _webdav_encode_href(owner, sf, is_dir=True)
+                sf_name = os.path.basename(sf)
+                responses.append(f"""
+                <D:response>
+                    <D:href>{sf_href}</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>{html.escape(sf_name)}</D:displayname>
+                            <D:resourcetype><D:collection/></D:resourcetype>
+                            <D:getlastmodified>{http_date}</D:getlastmodified>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>""")
+
+            for df in direct_files:
+                df_path = f"{norm_path.rstrip('/')}/{df['filename']}"
+                df_href = _webdav_encode_href(owner, df_path, is_dir=False)
+                mime, _ = mimetypes.guess_type(df["filename"])
+                mime = mime or "application/octet-stream"
+                sz = int(df.get("size", 0))
+                responses.append(f"""
+                <D:response>
+                    <D:href>{df_href}</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>{html.escape(df['filename'])}</D:displayname>
+                            <D:resourcetype/>
+                            <D:getcontentlength>{sz}</D:getcontentlength>
+                            <D:getcontenttype>{html.escape(mime)}</D:getcontenttype>
+                            <D:getlastmodified>{http_date}</D:getlastmodified>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>""")
+
+    return '<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">' + "".join(responses) + "\n</D:multistatus>"
+
+async def _handle_webdav_request(request: Request, owner: str, subpath: str = "") -> Response:
+    method = request.method.upper()
+    dav_headers = {
+        "DAV": "1, 2",
+        "MS-Author-Via": "DAV",
+        "Allow": "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE",
+    }
+
+    if method == "OPTIONS":
+        return Response(status_code=200, headers=dav_headers)
+
+    if not supabase:
+        return Response("Database offline", status_code=503, headers=dav_headers)
+
+    ok, actor = _webdav_auth(request, owner)
+    if not ok:
+        return _webdav_unauthorized()
+
+    norm_path = "/" + urllib.parse.unquote(subpath).strip("/") if subpath.strip("/") else "/"
+    parent_folder = os.path.dirname(norm_path) or "/"
+    item_name = os.path.basename(norm_path)
+
+    if method == "PROPFIND":
+        depth = request.headers.get("Depth", "1").strip()
+        items = supabase.table("nxt_files").select("*").eq("owner", owner).eq("is_deleted", False).execute().data or []
+        xml_body = _webdav_propfind_xml(owner, norm_path, depth, items)
+        if xml_body is None:
+            return Response(status_code=404, headers=dav_headers)
+        return Response(
+            content=xml_body.encode("utf-8"),
+            status_code=207,
+            media_type='application/xml; charset="utf-8"',
+            headers=dav_headers,
+        )
+
+    elif method in ["GET", "HEAD"]:
+        if norm_path == "/":
+            return Response(content=b"VaultGrid WebDAV Root", status_code=200, headers=dav_headers)
+        res = (
+            supabase.table("nxt_files")
+            .select("*")
+            .eq("owner", owner)
+            .eq("folder", parent_folder)
+            .eq("filename", item_name)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        if not res.data:
+            return Response(status_code=404, headers=dav_headers)
+        rec = res.data[0]
+        mime, _ = mimetypes.guess_type(item_name)
+        mime = mime or "application/octet-stream"
+        f_headers = {**dav_headers, "Content-Length": str(rec.get("size", 0))}
+        if method == "HEAD":
+            return Response(status_code=200, media_type=mime, headers=f_headers)
+        if not rec.get("file_url", "").startswith("http") or int(rec.get("size", 0)) == 0:
+            return Response(content=b"", status_code=200, media_type=mime, headers=f_headers)
+        try:
+            with urllib.request.urlopen(rec["file_url"], timeout=15) as resp:
+                data = resp.read()
+            return Response(content=data, status_code=200, media_type=mime, headers=dav_headers)
+        except Exception:
+            return Response(status_code=502, headers=dav_headers)
+
+    elif method == "PUT":
+        if norm_path == "/" or not item_name:
+            return Response(status_code=400, headers=dav_headers)
+        body_bytes = await request.body()
+
+        existing = (
+            supabase.table("nxt_files")
+            .select("*")
+            .eq("owner", owner)
+            .eq("folder", parent_folder)
+            .eq("filename", item_name)
+            .eq("is_deleted", False)
+            .execute()
+            .data
+            or []
+        )
+
+        # Windows Explorer nejprve posílá 0-byte PUT pro rezervaci souboru před samotným zápisem
+        if len(body_bytes) == 0:
+            if not existing:
+                supabase.table("nxt_files").insert({
+                    "owner": owner,
+                    "filename": item_name,
+                    "storage_provider": "huggingface",
+                    "file_url": "#",
+                    "folder": parent_folder,
+                    "size": 0,
+                    "is_deleted": False,
+                }).execute()
+            return Response(status_code=201, headers=dav_headers)
+
+        quota_limit = get_user_quota_bytes(owner)
+        all_rows = supabase.table("nxt_files").select("*").eq("is_deleted", False).execute().data or []
+        active_global = [r for r in all_rows if not is_system_record(r)]
+        current_used = sum(int(f.get("size", 0)) for f in active_global if f.get("owner") == owner)
+
+        if quota_limit > 0 and (current_used + len(body_bytes)) > quota_limit:
+            return Response("Insufficient Storage (Quota Exceeded)", status_code=507, headers=dav_headers)
+
+        dest_folder, auto_tags = apply_vault_rules(owner, item_name, parent_folder)
+        repo_id = get_active_write_repo(active_global)
+        repo_path = f"{owner}{dest_folder}/{item_name}".replace("//", "/")
+
+        if hf_api and repo_id:
+            hf_api.upload_file(path_or_fileobj=body_bytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
+            public_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+        else:
+            public_url = "#"
+
+        if existing:
+            supabase.table("nxt_files").update({
+                "file_url": public_url,
+                "folder": dest_folder,
+                "size": len(body_bytes),
+            }).eq("id", existing[0]["id"]).execute()
+            status_code = 204
+        else:
+            ins = supabase.table("nxt_files").insert({
+                "owner": owner,
+                "filename": item_name,
+                "storage_provider": "huggingface",
+                "file_url": public_url,
+                "folder": dest_folder,
+                "size": len(body_bytes),
+                "is_deleted": False,
+            }).execute()
+            if ins.data and auto_tags:
+                for t in auto_tags:
+                    attach_file_tag(owner, ins.data[0]["id"], t)
+            status_code = 201
+
+        log_audit(actor, "WEBDAV_PUT", f"Nahrán soubor přes WebDAV: {dest_folder}/{item_name} ({format_bytes(len(body_bytes))})", "INFO")
+        return Response(status_code=status_code, headers=dav_headers)
+
+    elif method == "MKCOL":
+        if norm_path == "/" or not item_name:
+            return Response(status_code=405, headers=dav_headers)
+        supabase.table("nxt_files").insert({
+            "owner": owner,
+            "filename": f".slozkové_meta_{item_name}",
+            "storage_provider": "system",
+            "file_url": "#",
+            "folder": norm_path,
+            "size": 0,
+            "is_deleted": False,
+        }).execute()
+        log_audit(actor, "WEBDAV_MKCOL", f"Vytvořena složka přes WebDAV: {norm_path}", "INFO")
+        return Response(status_code=201, headers=dav_headers)
+
+    elif method == "DELETE":
+        if norm_path == "/":
+            return Response(status_code=403, headers=dav_headers)
+        # Nejprve zkus smazat konkrétní soubor
+        f_res = (
+            supabase.table("nxt_files")
+            .select("id")
+            .eq("owner", owner)
+            .eq("folder", parent_folder)
+            .eq("filename", item_name)
+            .eq("is_deleted", False)
+            .execute()
+            .data
+            or []
+        )
+        if f_res:
+            for r in f_res:
+                supabase.table("nxt_files").update({"is_deleted": True}).eq("id", r["id"]).execute()
+            log_audit(actor, "WEBDAV_DELETE", f"Smazán soubor přes WebDAV: {norm_path}", "INFO")
+            return Response(status_code=204, headers=dav_headers)
+
+        # Jinak smaž celou složku a její obsah
+        all_items = supabase.table("nxt_files").select("id, folder").eq("owner", owner).eq("is_deleted", False).execute().data or []
+        deleted_any = False
+        for it in all_items:
+            if it.get("folder") == norm_path or it.get("folder", "").startswith(norm_path + "/"):
+                supabase.table("nxt_files").update({"is_deleted": True}).eq("id", it["id"]).execute()
+                deleted_any = True
+        if deleted_any:
+            log_audit(actor, "WEBDAV_DELETE_DIR", f"Smazána složka přes WebDAV: {norm_path}", "INFO")
+            return Response(status_code=204, headers=dav_headers)
+        return Response(status_code=404, headers=dav_headers)
+
+    elif method in ["MOVE", "COPY"]:
+        dest_hdr = request.headers.get("Destination", "")
+        if not dest_hdr:
+            return Response(status_code=400, headers=dav_headers)
+        dest_url_path = urllib.parse.unquote(urllib.parse.urlparse(dest_hdr).path)
+        prefix = f"/webdav/{owner}"
+        if not dest_url_path.startswith(prefix):
+            return Response(status_code=403, headers=dav_headers)
+        dest_rel = "/" + dest_url_path[len(prefix):].strip("/")
+        dest_folder = os.path.dirname(dest_rel) or "/"
+        dest_name = os.path.basename(dest_rel)
+
+        src_files = (
+            supabase.table("nxt_files")
+            .select("*")
+            .eq("owner", owner)
+            .eq("folder", parent_folder)
+            .eq("filename", item_name)
+            .eq("is_deleted", False)
+            .execute()
+            .data
+            or []
+        )
+        if src_files:
+            rec = src_files[0]
+            if method == "MOVE":
+                supabase.table("nxt_files").update({"folder": dest_folder, "filename": dest_name}).eq("id", rec["id"]).execute()
+            else:
+                supabase.table("nxt_files").insert({
+                    "owner": owner,
+                    "filename": dest_name,
+                    "storage_provider": rec.get("storage_provider", "huggingface"),
+                    "file_url": rec.get("file_url", "#"),
+                    "folder": dest_folder,
+                    "size": rec.get("size", 0),
+                    "is_deleted": False,
+                }).execute()
+            log_audit(actor, f"WEBDAV_{method}", f"{norm_path} -> {dest_rel}", "INFO")
+            return Response(status_code=201, headers=dav_headers)
+
+        # Přejmenování/přesun složky
+        if method == "MOVE":
+            all_items = supabase.table("nxt_files").select("*").eq("owner", owner).eq("is_deleted", False).execute().data or []
+            moved_dir = False
+            for it in all_items:
+                fld = it.get("folder", "")
+                if fld == norm_path or fld.startswith(norm_path + "/"):
+                    new_fld = dest_rel + fld[len(norm_path):]
+                    upd = {"folder": new_fld}
+                    if it.get("filename") == f".slozkové_meta_{item_name}":
+                        upd["filename"] = f".slozkové_meta_{dest_name}"
+                    supabase.table("nxt_files").update(upd).eq("id", it["id"]).execute()
+                    moved_dir = True
+            if moved_dir:
+                log_audit(actor, "WEBDAV_MOVE_DIR", f"{norm_path} -> {dest_rel}", "INFO")
+                return Response(status_code=201, headers=dav_headers)
+
+        return Response(status_code=404, headers=dav_headers)
+
+    return Response(status_code=405, headers=dav_headers)
+
+@app.api_route("/webdav/{owner}", methods=["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "COPY", "MOVE"])
+async def webdav_root_endpoint(request: Request, owner: str):
+    return await _handle_webdav_request(request, owner, "")
+
+@app.api_route("/webdav/{owner}/{subpath:path}", methods=["OPTIONS", "PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "COPY", "MOVE"])
+async def webdav_subpath_endpoint(request: Request, owner: str, subpath: str):
+    return await _handle_webdav_request(request, owner, subpath)
+
+# --- UI PRO SPRÁVU WEBDAV SÍŤOVÉHO DISKU ---
+@app.get("/webdav-manager", response_class=HTMLResponse)
+def webdav_manager_view(request: Request, username: str, password: str, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    q_params = f"username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&target_owner={urllib.parse.quote(view_owner)}"
+
+    base_url = str(request.base_url).rstrip("/")
+    if "onrender.com" in base_url and base_url.startswith("http://"):
+        base_url = "https://" + base_url[len("http://"):]
+    webdav_url = f"{base_url}/webdav/{view_owner}"
+
+    win_cmd = f'net use Z: "{webdav_url}" /user:{username} "{password}" /persistent:yes'
+    linux_cmd = f'sudo mount -t davfs "{webdav_url}" /mnt/vaultgrid -o username={username}'
+
+    body = f"""
+    <div class="alert-bar ok">
+        <div>
+            <strong>Nativní WebDAV Server (RFC 4918) je aktivní</strong><br>
+            <span style="color:var(--text-muted);">Připojte VaultGrid jako klasický pevný disk <code>Z:\\</code> přímo ve Windows Průzkumníku, macOS Finderu nebo Linuxu.</span>
+        </div>
+        <span class="badge badge-ok">PROTOCOL // DAV 1, 2</span>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("harddrive")} Připojovací údaje síťového disku</h2>
+            <a href="/webdav-manager/windows-bat?{q_params}" class="btn btn-sm">Stáhnout připojovací skript pro Windows (.bat)</a>
+        </div>
+        <div class="grid-2">
+            <div>
+                <label style="font-size:12px; color:var(--text-muted);">Síťová adresa (WebDAV URL)</label>
+                <input type="text" value="{html.escape(webdav_url)}" readonly class="mono" style="margin-top:4px;" onclick="this.select()">
+            </div>
+            <div>
+                <label style="font-size:12px; color:var(--text-muted);">Přihlašovací jméno / Heslo</label>
+                <input type="text" value="{html.escape(username)}  (vaše standardní heslo účtu)" readonly class="mono" style="margin-top:4px;">
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <div class="panel">
+            <div class="panel-header"><h3 class="panel-title">Windows 10 / 11 (Průzkumník souborů)</h3></div>
+            <ol style="margin:0 0 12px 18px; padding:0; color:var(--text-muted);">
+                <li>Otevřete <strong>Tento počítač</strong> → horní lišta <strong>Připojit síťovou jednotku</strong>.</li>
+                <li>Zvolte písmeno disku (např. <span class="mono">Z:</span>) a vložte WebDAV URL výše.</li>
+                <li>Zaškrtněte <em>Připojit pomocí jiných přihlašovacích údajů</em> a zadejte své jméno a heslo.</li>
+            </ol>
+            <label style="font-size:11.5px; color:var(--text-muted);">Nebo jedním příkazem v CMD / PowerShellu:</label>
+            <pre class="mono" style="background:var(--bg-app); padding:10px; border:1px solid var(--border); border-radius:4px; overflow-x:auto; margin-top:4px;">{html.escape(win_cmd)}</pre>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h3 class="panel-title">macOS Finder, Linux & Mobil (iOS / Android)</h3></div>
+            <ul style="margin:0 0 12px 18px; padding:0; color:var(--text-muted);">
+                <li><strong>macOS Finder:</strong> Stiskněte <span class="mono">Cmd + K</span>, vložte WebDAV URL a klikněte na <em>Připojit</em>.</li>
+                <li><strong>Mobil (Android / iOS):</strong> V aplikaci <em>Solid Explorer</em>, <em>Owlfiles</em> nebo <em>Soubory</em> přidejte úložiště typu <strong>WebDAV (HTTPS)</strong>.</li>
+            </ul>
+            <label style="font-size:11.5px; color:var(--text-muted);">Linux terminál (davfs2):</label>
+            <pre class="mono" style="background:var(--bg-app); padding:10px; border:1px solid var(--border); border-radius:4px; overflow-x:auto; margin-top:4px;">{html.escape(linux_cmd)}</pre>
+        </div>
+    </div>"""
+    return render_shell("WebDAV Síťový disk", "webdav", username, password, view_owner, body)
+
+@app.get("/webdav-manager/windows-bat")
+def webdav_windows_bat(request: Request, username: str, password: str, target_owner: str = None):
+    user = verify_user(username, password)
+    if not user:
+        return Response("Unauthorized", status_code=401)
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+    base_url = str(request.base_url).rstrip("/")
+    if "onrender.com" in base_url and base_url.startswith("http://"):
+        base_url = "https://" + base_url[len("http://"):]
+    webdav_url = f"{base_url}/webdav/{view_owner}"
+    bat_content = (
+        "@echo off\r\n"
+        "echo Pripojovani VaultGrid OS Enterprise jako sitovy disk Z:...\r\n"
+        "net use Z: /delete /y >nul 2>&1\r\n"
+        f'net use Z: "{webdav_url}" /user:{username} "{password}" /persistent:yes\r\n'
+        "if %errorlevel% equ 0 (\r\n"
+        "    echo Uspech! Disk Z: byl pripojen.\r\n"
+        "    explorer Z:\\\r\n"
+        ") else (\r\n"
+        "    echo Chyba pripojeni. Overte sluzbu WebClient ve Windows.\r\n"
+        ")\r\n"
+        "pause\r\n"
+    )
+    return Response(
+        content=bat_content.encode("utf-8"),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": 'attachment; filename="mount_vaultgrid_Z.bat"'},
+    )
+
+# --- SERVER-SIDE URL LEECHER (CLOUD DOWNLOADER) ---
+@app.get("/url-leecher", response_class=HTMLResponse)
+def url_leecher_view(username: str, password: str, target_owner: str = None, msg: str = "", is_err: bool = False):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+
+    logs = []
+    if supabase:
+        res = (
+            supabase.table("nxt_files")
+            .select("*")
+            .eq("owner", view_owner)
+            .eq("storage_provider", "vault_leecher_log")
+            .order("id", desc=True)
+            .limit(20)
+            .execute()
+        )
+        for r in (res.data or []):
+            try:
+                logs.append(json.loads(r.get("file_url", "{}")))
+            except Exception:
+                pass
+
+    log_rows = ""
+    for lg in logs:
+        log_rows += f"""
+        <tr>
+            <td class="mono">{html.escape(lg.get('ts', ''))}</td>
+            <td><strong>{html.escape(lg.get('filename', ''))}</strong></td>
+            <td class="mono" style="color:var(--text-muted); max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{html.escape(lg.get('source_url', ''))}</td>
+            <td class="mono">{html.escape(lg.get('dest_folder', '/'))}</td>
+            <td class="mono">{format_bytes(lg.get('size', 0))}</td>
+            <td><span class="badge badge-ok">{html.escape(str(lg.get('elapsed', '0')))} s</span></td>
+        </tr>"""
+    if not log_rows:
+        log_rows = "<tr><td colspan='6' style='text-align:center; color:var(--text-muted);'>Zatím nebyly provedeny žádné serverové přenosy z URL.</td></tr>"
+
+    alert_html = ""
+    if msg:
+        alert_html = f'<div class="alert-bar {"err" if is_err else "ok"}">{html.escape(msg)}</div>'
+
+    body = f"""
+    {alert_html}
+    <div class="panel">
+        <div class="panel-header">
+            <h2 class="panel-title">{svg("download_cloud")} Server-Side URL Leecher (Cloud Downloader)</h2>
+            <span class="badge badge-ok">ZERO CLIENT BANDWIDTH</span>
+        </div>
+        <p style="color:var(--text-muted); margin-top:0;">
+            Vložte přímý odkaz na soubor z internetu (např. <span class="mono">.zip</span>, <span class="mono">.iso</span>, <span class="mono">.mp4</span>, GitHub release). Server stáhne data přímo do úložiště Hugging Face bez zatížení vašeho připojení.
+        </p>
+        <form action="/url-leecher/fetch" method="POST">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <input type="hidden" name="password" value="{html.escape(password)}">
+            <input type="hidden" name="target_owner" value="{html.escape(view_owner)}">
+            <div class="grid-2" style="margin-bottom:10px;">
+                <div>
+                    <label style="font-size:12px; color:var(--text-muted);">Zdrojová URL adresa (HTTP / HTTPS)</label>
+                    <input type="url" name="source_url" placeholder="https://example.com/archiv.zip" required style="margin-top:4px;">
+                </div>
+                <div>
+                    <label style="font-size:12px; color:var(--text-muted);">Cílová složka ve VaultGridu</label>
+                    <input type="text" name="dest_folder" value="/Downloads" required style="margin-top:4px;">
+                </div>
+            </div>
+            <div class="form-row" style="margin-bottom:12px;">
+                <input type="text" name="custom_filename" placeholder="Vlastní název souboru (volitelné — prázdné = automaticky)" style="flex:1;">
+                <label style="display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); cursor:pointer;">
+                    <input type="checkbox" name="encrypt_flag" value="1" onchange="document.getElementById('leech-enc').style.display = this.checked ? 'inline-block' : 'none';">
+                    Zašifrovat při uložení (AES-256)
+                </label>
+                <input type="password" id="leech-enc" name="encrypt_pass" placeholder="Šifrovací heslo..." style="display:none; width:190px;">
+            </div>
+            <button type="submit" class="btn">{svg("download_cloud")} Stáhnout ze serveru přímo do cloudu</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><h2 class="panel-title">Historie serverových stažení</h2></div>
+        <table>
+            <thead><tr><th>Čas (UTC)</th><th>Uložený soubor</th><th>Zdrojová URL</th><th>Složka</th><th>Velikost</th><th>Doba</th></tr></thead>
+            <tbody>{log_rows}</tbody>
+        </table>
+    </div>"""
+    return render_shell("URL Cloud Stahovač", "leecher", username, password, view_owner, body)
+
+@app.post("/url-leecher/fetch", response_class=HTMLResponse)
+def url_leecher_fetch(
+    username: str = Form(...),
+    password: str = Form(...),
+    target_owner: str = Form(None),
+    source_url: str = Form(...),
+    dest_folder: str = Form("/Downloads"),
+    custom_filename: str = Form(""),
+    encrypt_flag: str = Form(""),
+    encrypt_pass: str = Form("")
+):
+    user = verify_user(username, password)
+    if not user:
+        return login_page()
+    view_owner = target_owner if (user["role"] == "admin" and target_owner) else username
+
+    clean_url = source_url.strip()
+    if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+        return url_leecher_view(username, password, view_owner, "Chyba: Povoleny jsou pouze protokoly HTTP a HTTPS.", True)
+
+    clean_folder = dest_folder.strip() or "/Downloads"
+    if not clean_folder.startswith("/"):
+        clean_folder = "/" + clean_folder
+
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(clean_url, headers={"User-Agent": "VaultGrid-OMV-Leecher/23.0"})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw_bytes = resp.read()
+            cd_header = resp.headers.get("Content-Disposition", "")
+    except Exception as e:
+        log_audit(username, "LEECHER_FAILED", f"Selhalo stažení {clean_url}: {e}", "WARN")
+        return url_leecher_view(username, password, view_owner, f"Chyba při stahování ze vzdáleného serveru: {e}", True)
+
+    # Určení názvu souboru
+    fname = custom_filename.strip().replace("/", "_")
+    if not fname and "filename=" in cd_header:
+        m = re.search(r'filename="?([^";]+)"?', cd_header)
+        if m:
+            fname = m.group(1).strip()
+    if not fname:
+        url_base = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(clean_url).path))
+        fname = url_base if url_base else f"download_{int(time.time())}.bin"
+
+    final_bytes = raw_bytes
+    final_name = fname
+    if encrypt_flag == "1" and encrypt_pass.strip():
+        final_bytes = vaultcrypt_encrypt(raw_bytes, encrypt_pass.strip())
+        final_name = fname + ".vgenc"
+
+    quota_limit = get_user_quota_bytes(view_owner)
+    all_rows = supabase.table("nxt_files").select("*").eq("is_deleted", False).execute().data or []
+    active_global = [r for r in all_rows if not is_system_record(r)]
+    current_used = sum(int(f.get("size", 0)) for f in active_global if f.get("owner") == view_owner)
+
+    if quota_limit > 0 and (current_used + len(final_bytes)) > quota_limit:
+        return url_leecher_view(username, password, view_owner, "Chyba: Stažený soubor by překročil diskovou kvótu účtu.", True)
+
+    routed_folder, auto_tags = apply_vault_rules(view_owner, final_name, clean_folder)
+    repo_id = get_active_write_repo(active_global)
+    repo_path = f"{view_owner}{routed_folder}/{final_name}".replace("//", "/")
+
+    if hf_api and repo_id:
+        hf_api.upload_file(path_or_fileobj=final_bytes, path_in_repo=repo_path, repo_id=repo_id, repo_type="dataset")
+        public_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{repo_path}"
+    else:
+        public_url = "#"
+
+    ins_res = supabase.table("nxt_files").insert({
+        "owner": view_owner,
+        "filename": final_name,
+        "storage_provider": "huggingface",
+        "file_url": public_url,
+        "folder": routed_folder,
+        "size": len(final_bytes),
+        "is_deleted": False,
+    }).execute()
+
+    if ins_res.data and auto_tags:
+        for t in auto_tags:
+            attach_file_tag(view_owner, ins_res.data[0]["id"], t)
+
+    elapsed = round(time.monotonic() - t0, 2)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    log_payload = json.dumps({
+        "ts": ts,
+        "filename": final_name,
+        "source_url": clean_url,
+        "dest_folder": routed_folder,
+        "size": len(final_bytes),
+        "elapsed": elapsed,
+    }, ensure_ascii=False)
+    supabase.table("nxt_files").insert({
+        "owner": view_owner,
+        "filename": "leecher_entry",
+        "storage_provider": "vault_leecher_log",
+        "file_url": log_payload,
+        "folder": "/_leecher",
+        "size": len(final_bytes),
+        "is_deleted": False,
+    }).execute()
+
+    log_audit(username, "LEECHER_SUCCESS", f"Staženo {final_name} ({format_bytes(len(final_bytes))}) z URL do {routed_folder}", "INFO")
+    return url_leecher_view(username, password, view_owner, f"Soubor '{final_name}' ({format_bytes(len(final_bytes))}) byl stažen přímo do {routed_folder} za {elapsed} s.")
 
 # --- 1. PŘIHLÁŠENÍ & OVERVIEW ---
 @app.get("/", response_class=HTMLResponse)
@@ -877,7 +1583,7 @@ def login_page():
             <div class="brand-title">{svg("server")} <span>VAULTGRID OS</span></div>
             <span class="brand-ver">v{html.escape(active_ver)}</span>
         </div>
-        <p style="color:var(--text-muted); margin-top:0; margin-bottom:16px;">Zero-Knowledge Cloud NAS & 7 TB Storage Platform (SSH konzole: <span class="mono">root / root</span>).</p>
+        <p style="color:var(--text-muted); margin-top:0; margin-bottom:16px;">Enterprise Cloud NAS & 7 TB Storage Platform (WebDAV <span class="mono">/webdav/&lt;user&gt;</span> | SSH konzole: <span class="mono">root / root</span>).</p>
         <form action="/login-router" method="POST">
             <label style="font-size:12px; color:var(--text-muted);">Uživatelské jméno</label>
             <input type="text" name="username" required autofocus style="margin:4px 0 12px 0;">
@@ -974,9 +1680,9 @@ def render_overview(username: str, password: str, view_owner: str) -> str:
             <div class="kpi-sub">{drops_cnt} aktivních VaultDrop odkazů</div>
         </div>
         <div class="kpi-card">
-            <div class="kpi-label">VaultGrid OS Runtime</div>
+            <div class="kpi-label">VaultGrid OMV Core</div>
             <div class="kpi-value">v{html.escape(get_installed_ota_version())}</div>
-            <div class="kpi-sub">{len(LOADED_OTA_MODULES)} OTA modulů | AES-256 Ready</div>
+            <div class="kpi-sub">WebDAV NAS + Server Leecher Ready</div>
         </div>
     </div>
 
@@ -999,13 +1705,13 @@ def render_overview(username: str, password: str, view_owner: str) -> str:
 
         <div class="panel">
             <div class="panel-header">
-                <h2 class="panel-title">{svg("server")} Rychlý přístup k nástrojům</h2>
+                <h2 class="panel-title">{svg("server")} Rychlý přístup k Enterprise nástrojům</h2>
             </div>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                <a href="/webdav-manager?{q_params}" class="btn btn-secondary">{svg("harddrive")} Připojit disk Z:\ (WebDAV)</a>
+                <a href="/url-leecher?{q_params}" class="btn btn-secondary">{svg("download_cloud")} Stáhnout z URL do cloudu</a>
                 <a href="/files?{q_params}&mode=dual" class="btn btn-secondary">{svg("columns")} Dual-Pane Commander</a>
-                <a href="/vaultdrop?{q_params}" class="btn btn-secondary">{svg("share")} VaultDrop Sdílení</a>
                 <a href="/vaultbackup?{q_params}" class="btn btn-secondary">{svg("save")} Zálohy & Snapshots</a>
-                <a href="/vaultrules?{q_params}" class="btn btn-secondary">{svg("zap")} VaultRules Pravidla</a>
             </div>
         </div>
     </div>
@@ -1347,7 +2053,10 @@ def render_files_view(
             </div>
 
             <div class="panel">
-                <div class="panel-header"><h3 class="panel-title">Nahrát soubory (s volitelným AES-256 šifrováním)</h3></div>
+                <div class="panel-header">
+                    <h3 class="panel-title">Nahrát soubory (s volitelným AES-256 šifrováním)</h3>
+                    <a href="/url-leecher?{q_params}" class="link-action">Stáhnout z URL</a>
+                </div>
                 <form action="/upload" method="POST" enctype="multipart/form-data">
                     <input type="hidden" name="username" value="{html.escape(username)}">
                     <input type="hidden" name="password" value="{html.escape(password)}">
@@ -2897,7 +3606,7 @@ def maintenance_verify_integrity(username: str = Form(...), password: str = Form
     log_audit(username, "INTEGRITY_SCAN", f"Zkontrolováno {len(active)} souborů, poškozených: {len(broken)}", "INFO")
     return maintenance_view(username, password, view_owner, f"Kontrola dokončena: {len(active)} souborů ověřeno, {len(broken)} neplatných odkazů.")
 
-# --- 11. VAULTUPDATE & OTA STUDIO (S KONTROLOU SYNTAXE PŘED AKTIVACÍ) ---
+# --- 11. VAULTUPDATE & OTA STUDIO ---
 @app.get("/vaultupdate", response_class=HTMLResponse)
 def vaultupdate_view(username: str, password: str, target_owner: str = None, status_msg: str = ""):
     user = verify_user(username, password)
@@ -3009,7 +3718,7 @@ def vaultupdate_view(username: str, password: str, target_owner: str = None, sta
             <div class="grid-2" style="margin-bottom:10px;">
                 <input type="text" name="mod_name" value="vaultnotes" placeholder="ID modulu" required>
                 <input type="text" name="mod_title" value="VaultNotes" placeholder="Název v navigaci" required>
-                <input type="text" name="new_version" value="22.1" placeholder="Verze" required>
+                <input type="text" name="new_version" value="23.1" placeholder="Verze" required>
                 <input type="text" name="release_notes" value="Nový OTA modul poznámek." placeholder="Changelog" required>
             </div>
             <textarea name="module_code" rows="14" class="code-box" style="margin-bottom:12px;" required>{html.escape(starter_module_code)}</textarea>
@@ -3074,7 +3783,7 @@ def vaultupdate_install(username: str = Form(...), password: str = Form(...), ta
             with urllib.request.urlopen(req, timeout=8) as resp:
                 code_str = resp.read().decode("utf-8")
             compile(code_str, f"<ota_{mname}>", "exec")
-            LOADED_OTA_MODULES[mname] = {"title": mod.get("title", mname), "sub": "OTA Modul", "version": str(mod.get("version", "22.1")), "code": code_str}
+            LOADED_OTA_MODULES[mname] = {"title": mod.get("title", mname), "sub": "OTA Modul", "version": str(mod.get("version", "23.1")), "code": code_str}
             supabase.table("nxt_files").delete().eq("storage_provider", "vault_ota_module").eq("filename", mname).execute()
             supabase.table("nxt_files").insert({
                 "owner": "system", "filename": mname, "storage_provider": "vault_ota_module",
